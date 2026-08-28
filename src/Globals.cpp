@@ -18,6 +18,7 @@
 #include "Features/LODBlending.h"
 #include "Features/LightLimitFix.h"
 #include "Features/LinearLighting.h"
+#include "Features/NeuralNR.h"
 #include "Features/PerformanceOverlay.h"
 #include "Features/RemoteControl.h"
 #include "Features/RenderDoc.h"
@@ -55,6 +56,7 @@ namespace globals
 		ID3D11DeviceContext* context = nullptr;
 		IDXGISwapChain* swapChain = nullptr;
 	}
+
 
 	namespace features
 	{
@@ -97,11 +99,13 @@ namespace globals
 		ExponentialHeightFog exponentialHeightFog{};
 		TruePBR truePBR{};
 		Skin skin{};
+		NeuralNR neuralNR{};
 
 		namespace llf
 		{
 		}
 	}
+
 
 	namespace game
 	{
@@ -146,6 +150,7 @@ namespace globals
 		if (auto tes = RE::TES::GetSingleton())
 			game::tes = tes;
 	}
+
 
 	namespace rtti
 	{
