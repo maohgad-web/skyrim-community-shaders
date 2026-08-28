@@ -1,0 +1,7 @@
+NeuralNR — commit test
+=======================
+This file exists only to verify that the GitHub tooling can create files
+and push commits to this fork. It is inert to the build (not under
+Shaders/, so no CMake glob or AIO copy rule picks it up).
+
+Safe to delete.
