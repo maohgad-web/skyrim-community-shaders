@@ -20,6 +20,7 @@
 #include "Features/LODBlending.h"
 #include "Features/LightLimitFix.h"
 #include "Features/LinearLighting.h"
+#include "Features/NeuralNR.h"
 #include "Features/PerformanceOverlay.h"
 #include "Features/RemoteControl.h"
 #include "Features/RenderDoc.h"
@@ -257,7 +258,8 @@ const std::vector<Feature*>& Feature::GetFeatureList()
 		&globals::features::horizonFix,
 		&globals::features::exponentialHeightFog,
 		&globals::features::hdrDisplay,
-		&globals::features::skin
+		&globals::features::skin,
+		&globals::features::neuralNR
 	};
 
 	return features;
@@ -309,7 +311,7 @@ bool Feature::ReapplyOverrideSettings()
 	json featureJson;
 	SaveSettings(featureJson);
 
-	// Apply overrides to the settings (without user customizations)
+	// Apply the overrides to the settings (without user customizations)
 	size_t appliedCount = overrideManager->ReapplyFeatureOverrides(featureName, featureJson);
 
 	if (appliedCount > 0) {
