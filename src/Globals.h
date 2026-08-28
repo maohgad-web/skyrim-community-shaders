@@ -39,6 +39,7 @@ struct ExponentialHeightFog;
 struct HDRDisplay;
 struct ScreenshotFeature;
 struct Skin;
+struct NeuralNR;
 
 class State;
 class Deferred;
@@ -89,6 +90,7 @@ namespace globals
 		extern IDXGISwapChain* swapChain;
 	}
 
+
 	namespace features
 	{
 		extern CloudShadows cloudShadows;
@@ -130,6 +132,7 @@ namespace globals
 		extern ExponentialHeightFog exponentialHeightFog;
 		extern TruePBR truePBR;
 		extern Skin skin;
+		extern NeuralNR neuralNR;
 
 	}
 
@@ -166,21 +169,19 @@ namespace globals
 		const Matrix& GetCameraViewProj() const { return data.CameraViewProj; }
 		/** Gets the unjittered camera view-projection matrix. */
 		const Matrix& GetCameraViewProjUnjittered() const { return data.CameraViewProjUnjittered; }
-		/** Gets the previous frame's unjittered view-projection matrix. */
+		/** Gets the previous frame's unjittered camera view-projection matrix. */
 		const Matrix& GetCameraPreviousViewProjUnjittered() const { return data.CameraPreviousViewProjUnjittered; }
 		/** Gets the unjittered camera projection matrix. */
 		const Matrix& GetCameraProjUnjittered() const { return data.CameraProjUnjittered; }
-		/** Gets the inverse of the unjittered camera projection matrix. */
-		const Matrix& GetCameraProjUnjitteredInverse() const { return data.CameraProjUnjitteredInverse; }
-		/** Gets the inverse camera view matrix. */
-		const Matrix& GetCameraViewInverse() const { return data.CameraViewInverse; }
 		/** Gets the inverse camera view-projection matrix. */
 		const Matrix& GetCameraViewProjInverse() const { return data.CameraViewProjInverse; }
+		/** Gets the inverse camera view matrix. */
+		const Matrix& GetCameraViewInverse() const { return data.CameraViewInverse; }
 		/** Gets the inverse camera projection matrix. */
 		const Matrix& GetCameraProjInverse() const { return data.CameraProjInverse; }
 		/** Gets the camera position adjustment vector. */
 		const float4& GetCameraPosAdjust() const { return data.CameraPosAdjust; }
-		/** Gets the previous frame's camera position adjustment vector. */
+		/** Gets the previous camera position adjustment vector. */
 		const float4& GetCameraPreviousPosAdjust() const { return data.CameraPreviousPosAdjust; }
 		/** Gets the frame parameters (timer, frame count, etc.). */
 		const float4& GetFrameParams() const { return data.FrameParams; }
@@ -189,6 +190,7 @@ namespace globals
 		/** Gets the second set of dynamic resolution parameters. */
 		const float4& GetDynamicResolutionParams2() const { return data.DynamicResolutionParams2; }
 	};
+
 
 	namespace game
 	{
@@ -226,6 +228,7 @@ namespace globals
 		extern D3D11_MAPPED_SUBRESOURCE* mappedFrameBuffer;
 		extern FrameBufferCache frameBufferCached;
 	}
+
 
 	namespace rtti
 	{
