@@ -4,13 +4,12 @@
 // replace this body behind the same Install()/Uninstall() API. Otherwise
 // CreateFeature fails at the gate and the feature disables — signalled below.
 #include "CallerSpoof.h"
-#include "Logger.h"
 
 namespace CSS::CallerSpoof
 {
 	void Install()
 	{
-		log::info("NeuralNR: caller-spoof NOT installed (no-op seam). "
+		logger::info("NeuralNR: caller-spoof NOT installed (no-op seam). "
 		           "If CreateFeature fails on caller verification, this is why.");
 	}
 	void Uninstall() {}
