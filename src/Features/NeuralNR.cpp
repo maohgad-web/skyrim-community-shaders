@@ -2,7 +2,6 @@
 #include "Features/NeuralNR/CallerSpoof.h"
 #include "Features/Upscaling.h"
 #include "Globals.h"
-#include "Logger.h"
 
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -70,7 +69,7 @@ namespace CSS
 		if (FAILED(dev->CheckFeatureSupport(D3D11_FEATURE_DRIVER_METADATA, &meta, sizeof(meta)))) return false;
 		// CALIBRATE: verify bit layout against the value your 616 driver logs.
 		const auto major = (meta.DriverVersion >> 16) & 0xFFFF;
-		log::info("NeuralNR: driver raw=0x{:08X} major={}", meta.DriverVersion, major);
+		logger::info("NeuralNR: driver raw=0x{:08X} major={}", meta.DriverVersion, major);
 		return major >= 616;
 	}
 
@@ -80,13 +79,13 @@ namespace CSS
 		auto dir = Globals::DataDir + L"\\Shaders\\";
 		auto compile = [&](const std::wstring& file, const char* entry, ID3D11ComputeShader** out) {
 			std::ifstream f(dir + file, std::ios::binary);
-			if (!f) { log::warn("NeuralNR: missing shader {}", file); return false; }
+			if (!f) { logger::warn("NeuralNR: missing shader {}", file); return false; }
 			std::stringstream ss; ss << f.rdbuf();
 			auto src = ss.str();
 			ID3DBlob* blob = nullptr;
 			if (FAILED(D3DCompile(src.c_str(), src.size(), file.c_str(), nullptr,
 				D3D_COMPILE_STANDARD_DEBUG_INCLUDES, entry, "cs_6_0", 0, 0, &blob, nullptr)))
-			{ log::warn("NeuralNR: D3DCompile failed for {}", file); return false; }
+			{ logger::warn("NeuralNR: D3DCompile failed for {}", file); return false; }
 			auto hr = globals::d3d::device->CreateComputeShader(
 				blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, out);
 			blob->Release();
@@ -106,10 +105,10 @@ namespace CSS
 		CallerSpoof::Uninstall();
 		if (!NVSDK_NGX_SUCCEED(res) || !s.nrFeature)
 		{
-			log::error("NeuralNR: CreateFeature failed, res=0x{:X}", static_cast<uint32_t>(res));
+			logger::error("NeuralNR: CreateFeature failed, res=0x{:X}", static_cast<uint32_t>(res));
 			return false;
 		}
-		log::info("NeuralNR: CreateFeature Success.");
+		logger::info("NeuralNR: CreateFeature Success.");
 		return true;
 	}
 
@@ -175,12 +174,12 @@ namespace CSS
 				if (SUCCEEDED(dres->QueryInterface(IID_PPV_ARGS(&dtex))))
 				{
 					D3D11_TEXTURE2D_DESC dd{}; dtex->GetDesc(&dd);
-					log::info("NeuralNR: Skyrim Depth Format: 0x{:X}", static_cast<uint32_t>(dd.Format));
+					logger::info("NeuralNR: Skyrim Depth Format: 0x{:X}", static_cast<uint32_t>(dd.Format));
 					D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
 					sd.Format = DXGI_FORMAT_R32_FLOAT; // CALIBRATE: override for typeless depth
 					sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sd.Texture2D.MipLevels = 1;
 					if (FAILED(dev->CreateShaderResourceView(dtex, &sd, &s.depthSRV)))
-						log::warn("NeuralNR: depth SRV (R32_FLOAT override) failed");
+						logger::warn("NeuralNR: depth SRV (R32_FLOAT override) failed");
 					dtex->Release();
 				}
 				dres->Release();
@@ -298,7 +297,7 @@ namespace CSS
 		NVSDK_NGX_Result evalRes = ((PFN_EvaluateFeature)s.pfnEvaluateFeature)(
 			ctx, s.nrFeature, P, nullptr);
 		if (!NVSDK_NGX_SUCCEED(evalRes))
-		{ log::warn("NeuralNR: EvaluateFeature failed, res=0x{:X}", static_cast<uint32_t>(evalRes)); back->Release(); return; }
+		{ logger::warn("NeuralNR: EvaluateFeature failed, res=0x{:X}", static_cast<uint32_t>(evalRes)); back->Release(); return; }
 
 		if (hdr) { DispatchTransfer(); ctx->CopyResource(back, s.transferOut); }
 		else     { ctx->CopyResource(back, s.nrOutputTex); }
@@ -310,21 +309,21 @@ namespace CSS
 		auto& s = GetState();
 		LoadDLL();
 		if (!s.hDLL || !s.pfnCreateFeature || !s.pfnEvaluateFeature)
-		{ log::info("NeuralNR: DLL/exports not found — disabled"); return; }
+		{ logger::info("NeuralNR: DLL/exports not found — disabled"); return; }
 		if (!CheckGate())
-		{ log::info("NeuralNR: gate failed — disabled"); return; }
+		{ logger::info("NeuralNR: gate failed — disabled"); return; }
 		if (!CompileShaders())
-		{ log::info("NeuralNR: shader compile failed"); return; }
+		{ logger::info("NeuralNR: shader compile failed"); return; }
 		int version = 0;
 		// CALIBRATE: confirm Init_Ext signature + return type.
 		if (FAILED(((PFN_InitExt)s.pfnInitExt)("css-neuralnr", L"", globals::d3d::device, &version, nullptr)))
-		{ log::info("NeuralNR: Init_Ext failed"); return; }
+		{ logger::info("NeuralNR: Init_Ext failed"); return; }
 		if (!s.pfnAllocateParameters)
-		{ log::info("NeuralNR: AllocateParameters export missing"); return; }
+		{ logger::info("NeuralNR: AllocateParameters export missing"); return; }
 		s.nrParams = ((PFN_AllocParams)s.pfnAllocateParameters)(&s.nrParams);
 		if (!s.nrParams)
-		{ log::info("NeuralNR: AllocateParameters failed"); return; }
-		log::info("NeuralNR: ready to create feature (NGX v{})", version);
+		{ logger::info("NeuralNR: AllocateParameters failed"); return; }
+		logger::info("NeuralNR: ready to create feature (NGX v{})", version);
 	}
 
 	void NeuralNR::Reset() { GetState().needsReset = true; }
