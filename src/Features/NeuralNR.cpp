@@ -158,7 +158,7 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 		if (s.mvTex) return; 
 		if (auto* mv = globals::features::upscaling.motionVectorCopyTexture)
 		{
-			auto* raw = static_cast<ID3D11Texture2D*>(mv->resource);
+			auto* raw = static_cast<ID3D11Texture2D*>(mv->resource.get());
 			if (raw)
 			{
 				mkTex(&s.mvTex, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_SHADER_RESOURCE);
