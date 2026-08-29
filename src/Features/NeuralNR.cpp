@@ -27,13 +27,6 @@ namespace
 
 	void* s_pfnReleaseFeature = nullptr;
 
-	// PATCH: checks the swap chain's actual negotiated output color space
-	// (real HDR10/PQ signal) instead of the backbuffer's pixel format. A
-	// float/10-bit backbuffer format is commonly used for internal rendering
-	// precision (bloom, tonemapping headroom) whether or not HDR output is
-	// actually active — checking the format alone was a false positive on a
-	// setup with HDR genuinely off everywhere (INI, NVIDIA App, Windows).
-	// Fails safe: returns false (SDR path) if any query along the way fails.
 	bool IsActuallyHDROutput(IDXGISwapChain* swapChain)
 	{
 		bool isHDR = false;
@@ -67,16 +60,13 @@ void NeuralNR::LoadDLL()
 {
 	auto& s = GetState();
 
-	auto path = Util::PathHelpers::GetFeatureShaderPath("NeuralNR") / L"nvngx_dlssnr.dll";
-	if (!std::filesystem::exists(path))
-	{
-		path = Util::PathHelpers::GetShadersPath() / L"Upscaling" / L"Streamline" / L"nvngx_dlssnr.dll";
-	}
+	// FIX: Load the core NVIDIA NGX SDK to get the function exports, NOT the payload DLL.
+	s.hDLL = LoadLibraryW(L"nvngx.dll");
+	if (!s.hDLL) s.hDLL = LoadLibraryW(L"_nvngx.dll");
 
-	s.hDLL = LoadLibraryW(path.c_str());
 	if (!s.hDLL)
 	{
-		logger::warn("NeuralNR: Could not find nvngx_dlssnr.dll at {}", path.string());
+		logger::warn("NeuralNR: Could not find the core NGX library (nvngx.dll or _nvngx.dll).");
 		return;
 	}
 
@@ -85,7 +75,7 @@ void NeuralNR::LoadDLL()
 	s.pfnCreateFeature      = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_CreateFeature");
 	s.pfnEvaluateFeature    = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
 	s.pfnDestroyParameters  = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_DestroyParameters");
-	s_pfnReleaseFeature     = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_ReleaseFeature");
+	s.pfnReleaseFeature     = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_ReleaseFeature");
 }
 
 bool NeuralNR::CheckGate()
@@ -192,16 +182,8 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 		return SUCCEEDED(dev->CreateUnorderedAccessView(t, &ud, out));
 	};
 
-	// PATCH: previously created a brand-new, separately allocated s.mvTex
-	// and never copied real motion vector data into it — NGX was being
-	// handed zeroed/garbage GPU memory every frame regardless of whether
-	// EvaluateFeature succeeded. Fixed by building a view directly onto
-	// Upscaling's own live motion-vector resource instead: it's refreshed
-	// every frame by Upscaling's own pipeline (the "copy" in its name),
-	// so a view onto it stays current with no copy step of our own —
-	// and using its real queried format instead of a guessed one.
 	auto tryCreateMotionVectorTexture = [&]() {
-		if (s.mvSRV) return; // already have a view
+		if (s.mvSRV) return; 
 		if (auto* mv = globals::features::upscaling.motionVectorCopyTexture)
 		{
 			auto* raw = static_cast<ID3D11Texture2D*>(mv->resource.get());
@@ -321,8 +303,6 @@ void NeuralNR::OnPresent()
 	auto& s = GetState();
 	if (!s.initialized)
 	{
-		// LAZY INIT: Because the feature isn't registered in FeatureVersions.h yet,
-		// the engine never calls PostPostLoad(). We manually trigger it on Frame 1.
 		static bool s_setupAttempted = false;
 		if (!s_setupAttempted)
 		{
@@ -346,11 +326,6 @@ void NeuralNR::OnPresent()
 
 	if (!s.inputColor || !s.nrOutputTex || !s.mvSRV || !s.depthSRV) { back->Release(); return; }
 
-	// PATCH: real HDR10/PQ output check (see IsActuallyHDROutput above),
-	// replacing the hardcoded `false` — checks the swap chain's negotiated
-	// color space instead of its storage format, so it correctly reads SDR
-	// when HDR is genuinely off everywhere, while still flipping true for a
-	// setup where HDR output is actually active.
 	const bool hdr = IsActuallyHDROutput(globals::d3d::swapChain);
 
 	ctx->CopyResource(s.inputColor, back);
@@ -399,16 +374,9 @@ void NeuralNR::OnPresent()
 	}
 	else if (!NVSDK_NGX_SUCCEED(evalRes))
 	{
-		// PATCH: throttled failure logging — was previously unconditional
-		// every frame, which floods the log at 60+ fps during exactly the
-		// debugging session where you need it readable. Now logs
-		// immediately on the first failure, immediately again if the
-		// result code changes (a different problem than before), and
-		// otherwise re-logs periodically as a "still failing" heartbeat
-		// instead of every single frame.
 		static NVSDK_NGX_Result s_lastLoggedFailure = static_cast<NVSDK_NGX_Result>(-1);
 		static uint32_t s_failureLogFrameCounter = 0;
-		constexpr uint32_t kFailureLogIntervalFrames = 300; // ~5s at 60fps
+		constexpr uint32_t kFailureLogIntervalFrames = 300; 
 
 		const bool isNewFailureCode = (evalRes != s_lastLoggedFailure);
 		++s_failureLogFrameCounter;
@@ -431,15 +399,22 @@ void NeuralNR::PostPostLoad()
 {
 	auto& s = GetState();
 	LoadDLL();
+	
 	if (!s.hDLL || !s.pfnCreateFeature || !s.pfnEvaluateFeature)
-	{ logger::info("NeuralNR: DLL/exports not found — disabled"); return; }
+	{ logger::info("NeuralNR: Core DLL or required exports not found — disabled"); return; }
+	
 	if (!CheckGate())
 	{ logger::info("NeuralNR: gate failed — disabled"); return; }
+	
 	if (!CompileShaders())
 	{ logger::info("NeuralNR: shader compile failed"); return; }
 
-	// Use a valid path for NGX logging/temp files instead of an empty string
+	// Point NGX to the folder containing the DLSS NR payload (nvngx_dlssnr.dll)
 	std::wstring appPath = Util::PathHelpers::GetFeatureShaderPath("NeuralNR").wstring();
+	if (!std::filesystem::exists(Util::PathHelpers::GetFeatureShaderPath("NeuralNR") / L"nvngx_dlssnr.dll"))
+	{
+		appPath = (Util::PathHelpers::GetShadersPath() / L"Upscaling" / L"Streamline").wstring();
+	}
 
 	NVSDK_NGX_Result initRes = ((PFN_InitExt)s.pfnInitExt)(
 		0x1337ULL, 
@@ -452,8 +427,6 @@ void NeuralNR::PostPostLoad()
 	if (!NVSDK_NGX_SUCCEED(initRes))
 	{ 
 		logger::warn("NeuralNR: Init_Ext failed with result code: 0x{:X}", static_cast<uint32_t>(initRes)); 
-		// Because Streamline (Upscaling) likely initialized the NGX context already, 
-		// we will ignore this failure and attempt to proceed to AllocateParameters.
 	}
 
 	if (!s.pfnAllocateParameters)
@@ -463,6 +436,7 @@ void NeuralNR::PostPostLoad()
 
 	if (!s.nrParams)
 	{ logger::info("NeuralNR: AllocateParameters failed"); return; }
+	
 	logger::info("NeuralNR: ready to create feature");
 }
 
