@@ -179,15 +179,24 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 		return SUCCEEDED(dev->CreateUnorderedAccessView(t, &ud, out));
 	};
 
+	// PATCH: previously created a brand-new, separately allocated s.mvTex
+	// and never copied real motion vector data into it — NGX was being
+	// handed zeroed/garbage GPU memory every frame regardless of whether
+	// EvaluateFeature succeeded. Fixed by building a view directly onto
+	// Upscaling's own live motion-vector resource instead: it's refreshed
+	// every frame by Upscaling's own pipeline (the "copy" in its name),
+	// so a view onto it stays current with no copy step of our own —
+	// and using its real queried format instead of a guessed one.
 	auto tryCreateMotionVectorTexture = [&]() {
-		if (s.mvTex) return;
+		if (s.mvSRV) return; // already have a view
 		if (auto* mv = globals::features::upscaling.motionVectorCopyTexture)
 		{
 			auto* raw = static_cast<ID3D11Texture2D*>(mv->resource.get());
 			if (raw)
 			{
-				mkTex(&s.mvTex, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_SHADER_RESOURCE);
-				mkSRV(s.mvTex, DXGI_FORMAT_R16G16_FLOAT, &s.mvSRV);
+				D3D11_TEXTURE2D_DESC desc{};
+				raw->GetDesc(&desc);
+				mkSRV(raw, desc.Format, &s.mvSRV);
 			}
 		}
 	};
@@ -313,7 +322,7 @@ void NeuralNR::OnPresent()
 	if (s.w != w || s.h != h) s.needsReset = true;
 	CreateResources(w, h, dsc.Format);
 
-	if (!s.inputColor || !s.nrOutputTex || !s.mvTex || !s.depthSRV) { back->Release(); return; }
+	if (!s.inputColor || !s.nrOutputTex || !s.mvSRV || !s.depthSRV) { back->Release(); return; }
 
 	// PATCH: real HDR10/PQ output check (see IsActuallyHDROutput above),
 	// replacing the hardcoded `false` — checks the swap chain's negotiated
@@ -345,7 +354,7 @@ void NeuralNR::OnPresent()
 
 	P->Set("DLSSNR.Color",  (ID3D11Resource*)(hdr ? s.sdrProxyTex : s.inputColor));
 	P->Set("DLSSNR.Output", (ID3D11Resource*)s.nrOutputTex);
-	P->Set("DLSSNR.MVec",   (ID3D11Resource*)s.mvTex);
+	P->Set("DLSSNR.MVec",   ResourceFromView(s.mvSRV));
 	P->Set("DLSSNR.Depth",  ResourceFromView(s.depthSRV));
 
 	auto SetSubrect = [&](const char* name) {
