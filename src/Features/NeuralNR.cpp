@@ -60,7 +60,7 @@ void NeuralNR::LoadDLL()
 {
 	auto& s = GetState();
 
-	// Load the core NVIDIA NGX SDK to obtain function exports
+	// Load the core NVIDIA NGX SDK to get the function exports
 	s.hDLL = LoadLibraryW(L"nvngx.dll");
 	if (!s.hDLL) s.hDLL = LoadLibraryW(L"_nvngx.dll");
 
@@ -427,7 +427,7 @@ void NeuralNR::PostPostLoad()
 	if (!CompileShaders())
 	{ logger::info("NeuralNR: shader compile failed"); return; }
 
-	// Ensure string buffers and pointers persist in memory across the NGX lifecycle
+	// MUST BE STATIC: NGX caches these pointers in memory until CreateFeature is called
 	static std::wstring appPath = Util::PathHelpers::GetFeatureShaderPath("NeuralNR").wstring();
 	static std::wstring dllSearchPath = appPath;
 
