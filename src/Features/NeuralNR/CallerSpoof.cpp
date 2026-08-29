@@ -8,12 +8,14 @@ namespace CSS::CallerSpoof
 {
 	using GetModuleFileNameW_t = DWORD(WINAPI*)(HMODULE, LPWSTR, DWORD);
 	static GetModuleFileNameW_t s_origK32 = nullptr;
+	static HMODULE s_ourModule = nullptr;
 
 	static DWORD WINAPI HookedK32(HMODULE hModule, LPWSTR lpFilename, DWORD nSize)
 	{
-		// Critical: Only spoof queries targeting the host executable (NULL module).
-		// NGX uses NULL to validate the host application signature.
-		if (hModule == nullptr && lpFilename && nSize > 0)
+		// CRITICAL FIX: Only spoof queries targeting OUR plugin module (s_ourModule).
+		// DO NOT spoof NULL. NGX needs to see the real Skyrim executable to apply
+		// driver profiles. Spoofing NULL on 560+ drivers triggers 0xBAD0000C.
+		if (hModule == s_ourModule && lpFilename && nSize > 0)
 		{
 			const wchar_t* spoof = L"C:\\Windows\\System32\\nvngx.dll";
 			const DWORD len = static_cast<DWORD>(wcslen(spoof));
@@ -28,7 +30,7 @@ namespace CSS::CallerSpoof
 			return len;
 		}
 
-		// Forward all other module lookups normally
+		// Forward all other module lookups normally (including NULL / SkyrimSE.exe)
 		if (s_origK32) return s_origK32(hModule, lpFilename, nSize);
 		return 0;
 	}
@@ -78,10 +80,15 @@ namespace CSS::CallerSpoof
 
 	void Install()
 	{
+		// Capture our own plugin handle for the spoof target
+		GetModuleHandleExW(
+			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCWSTR>(&Install),
+			&s_ourModule);
+
 		HMODULE hCore = GetModuleHandleW(L"_nvngx.dll");
 		HMODULE hNGX  = GetModuleHandleW(L"nvngx.dll");
 		
-		// Preemptively load the NR payload so we can intercept its validation handshake
 		HMODULE hNR = GetModuleHandleW(L"nvngx_dlssnr.dll");
 		if (!hNR) 
 		{
@@ -102,6 +109,5 @@ namespace CSS::CallerSpoof
 
 	void Uninstall()
 	{
-		// IAT uninstallation is inherently handled on process exit.
 	}
 }

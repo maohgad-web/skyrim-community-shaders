@@ -60,7 +60,6 @@ void NeuralNR::LoadDLL()
 {
 	auto& s = GetState();
 
-	// Load the core NVIDIA NGX SDK to get the function exports
 	s.hDLL = LoadLibraryW(L"nvngx.dll");
 	if (!s.hDLL) s.hDLL = LoadLibraryW(L"_nvngx.dll");
 
@@ -427,7 +426,6 @@ void NeuralNR::PostPostLoad()
 	if (!CompileShaders())
 	{ logger::info("NeuralNR: shader compile failed"); return; }
 
-	// MUST BE STATIC: NGX caches these pointers in memory until CreateFeature is called
 	static std::wstring appPath = Util::PathHelpers::GetFeatureShaderPath("NeuralNR").wstring();
 	static std::wstring dllSearchPath = appPath;
 
@@ -442,8 +440,11 @@ void NeuralNR::PostPostLoad()
 	featureInfo.PathListInfo.Path = searchPaths;
 	featureInfo.PathListInfo.Length = 1;
 
+	// Use valid generic AppID to bypass driver blacklists, and do NOT return if Init_Ext fails.
+	// Streamline has already initialized NGX globally; if Init_Ext throws a double-init or
+	// out-of-date conflict, we gracefully piggyback on Streamline's valid context.
 	NVSDK_NGX_Result initRes = ((PFN_InitExt)s.pfnInitExt)(
-		0x1337ULL, 
+		231313132ULL, 
 		appPath.c_str(), 
 		globals::d3d::device, 
 		&featureInfo,
@@ -452,8 +453,7 @@ void NeuralNR::PostPostLoad()
 
 	if (!NVSDK_NGX_SUCCEED(initRes))
 	{ 
-		logger::warn("NeuralNR: Init_Ext failed with result code: 0x{:X}", static_cast<uint32_t>(initRes)); 
-		return;
+		logger::warn("NeuralNR: Init_Ext failed with result code: 0x{:X}. Proceeding to allocate parameters via Streamline context...", static_cast<uint32_t>(initRes)); 
 	}
 
 	if (!s.pfnAllocateParameters)
