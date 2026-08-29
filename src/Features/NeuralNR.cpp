@@ -438,8 +438,23 @@ void NeuralNR::PostPostLoad()
 	if (!CompileShaders())
 	{ logger::info("NeuralNR: shader compile failed"); return; }
 
-	if (!NVSDK_NGX_SUCCEED(((PFN_InitExt)s.pfnInitExt)(0x1337ULL, L"", globals::d3d::device, nullptr, NVSDK_NGX_Version_API)))
-	{ logger::info("NeuralNR: Init_Ext failed"); return; }
+	// Use a valid path for NGX logging/temp files instead of an empty string
+	std::wstring appPath = Util::PathHelpers::GetFeatureShaderPath("NeuralNR").wstring();
+
+	NVSDK_NGX_Result initRes = ((PFN_InitExt)s.pfnInitExt)(
+		0x1337ULL, 
+		appPath.c_str(), 
+		globals::d3d::device, 
+		nullptr, 
+		NVSDK_NGX_Version_API
+	);
+
+	if (!NVSDK_NGX_SUCCEED(initRes))
+	{ 
+		logger::warn("NeuralNR: Init_Ext failed with result code: 0x{:X}", static_cast<uint32_t>(initRes)); 
+		// Because Streamline (Upscaling) likely initialized the NGX context already, 
+		// we will ignore this failure and attempt to proceed to AllocateParameters.
+	}
 
 	if (!s.pfnAllocateParameters)
 	{ logger::info("NeuralNR: AllocateParameters export missing"); return; }
