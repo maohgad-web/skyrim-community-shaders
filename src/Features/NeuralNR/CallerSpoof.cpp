@@ -1,17 +1,22 @@
 #include "Features/NeuralNR/CallerSpoof.h"
-#include "stl/detour.h"
 #include <windows.h>
 #include <intrin.h>
 
 #pragma intrinsic(_ReturnAddress)
 
+// NOTE: no <detours/detours.h> include here on purpose — include/PCH.h is
+// force-included into every TU and already pulls in raw MS Detours
+// (DetourTransactionBegin/Attach/Detach/Commit), same as the PCH's own
+// detour_thunk.
+
 namespace CSS::CallerSpoof
 {
 	using GetModuleFileNameW_t = DWORD(WINAPI*)(HMODULE, LPWSTR, DWORD);
+	// Doubles as the Detours trampoline: after a successful DetourAttach,
+	// s_origK32/s_origKB point at the generated trampoline that forwards to
+	// the real GetModuleFileNameW, which is what HookedK32/HookedKB call.
 	static GetModuleFileNameW_t s_origK32 = nullptr;
 	static GetModuleFileNameW_t s_origKB  = nullptr;
-	static stl::detour_hook_t   s_hookK32{};
-	static stl::detour_hook_t   s_hookKB{};
 	static HMODULE              s_ourModule = nullptr;
 
 	static bool CallerIsNGX(void* returnAddress)
@@ -64,27 +69,49 @@ namespace CSS::CallerSpoof
 	{
 		if (s_origK32 || s_origKB) return;
 
+		// Our own module: the one NGX's GetModuleHandleExW(FROM_ADDRESS)
+		// resolves to when WE (the SCS plugin) call into the NGX DLLs.
 		GetModuleHandleExW(
 			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
 			reinterpret_cast<LPCWSTR>(&Install),
 			&s_ourModule);
 
-		s_hookK32.target = GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetModuleFileNameW");
-		s_hookK32.detour = (void*)HookedK32;
-		s_hookKB.target  = GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "GetModuleFileNameW");
-		s_hookKB.detour  = (void*)HookedKB;
+		// Two separate transactions on purpose: on modern Windows
+		// kernel32!GetModuleFileNameW is a forwarder stub to kernelbase, so
+		// the first attach may already patch the same real function the
+		// second one targets. Keeping them separate means a second-attach
+		// failure (already-patched target) cannot roll back the first.
+		DetourTransactionBegin();
+		DetourUpdateThread(GetCurrentThread());
+		DetourAttach((PVOID*)&s_origK32, (PVOID)HookedK32);
+		DetourTransactionCommit();
 
-		stl::detour_install(s_hookK32);
-		s_origK32 = (GetModuleFileNameW_t)s_hookK32.original;
-		stl::detour_install(s_hookKB);
-		s_origKB  = (GetModuleFileNameW_t)s_hookKB.original;
+		DetourTransactionBegin();
+		DetourUpdateThread(GetCurrentThread());
+		DetourAttach((PVOID*)&s_origKB, (PVOID)HookedKB);
+		DetourTransactionCommit();
 
-		logger::info("NeuralNR: caller-spoof installed (kernel32 + kernelbase).");
+		logger::info("NeuralNR: caller-spoof installed (kernel32={}, kernelbase={}).",
+			s_origK32 ? "ok" : "skipped", s_origKB ? "ok" : "skipped");
 	}
 
 	void Uninstall()
 	{
-		if (s_origK32) { stl::detour_uninstall(s_hookK32); s_origK32 = nullptr; }
-		if (s_origKB)  { stl::detour_uninstall(s_hookKB);  s_origKB = nullptr; }
+		if (s_origK32)
+		{
+			DetourTransactionBegin();
+			DetourUpdateThread(GetCurrentThread());
+			DetourDetach((PVOID*)&s_origK32, (PVOID)HookedK32);
+			DetourTransactionCommit();
+			s_origK32 = nullptr;
+		}
+		if (s_origKB)
+		{
+			DetourTransactionBegin();
+			DetourUpdateThread(GetCurrentThread());
+			DetourDetach((PVOID*)&s_origKB, (PVOID)HookedKB);
+			DetourTransactionCommit();
+			s_origKB = nullptr;
+		}
 	}
 }
