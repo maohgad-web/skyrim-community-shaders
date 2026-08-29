@@ -35,14 +35,20 @@ namespace CSS
 		{
 			bool initialized = false;
 			std::atomic<bool> needsReset{true};
-			HMODULE hDLL = nullptr;
+			// The gate-compliant caller (the shim) — user-provided. The gated
+			// snippet entry points are resolved from here. WE DO NOT PROVIDE IT.
+			HMODULE hBackend = nullptr;
+			// The NGX core (_nvngx.dll / nvngx.dll) — owns the capability param block.
+			HMODULE hCore = nullptr;
 			NVSDK_NGX_Handle* nrFeature = nullptr;
+			// The core's capability param block (NOT a fresh AllocateParameters).
 			NVSDK_NGX_Parameter* nrParams = nullptr;
 			void* pfnInitExt = nullptr;
-			void* pfnAllocateParameters = nullptr;
-			void* pfnCreateFeature = nullptr;
-			void* pfnEvaluateFeature = nullptr;
-			void* pfnDestroyParameters = nullptr;
+			void* pfnGetCapabilityParams = nullptr;   // core export
+			void* pfnPopulateParameters = nullptr;    // snippet, gated (via backend)
+			void* pfnCreateFeature = nullptr;         // snippet, gated (via backend)
+			void* pfnEvaluateFeature = nullptr;       // snippet, gated (via backend)
+			void* pfnReleaseFeature = nullptr;        // snippet, gated (via backend)
 
 			ID3D11Texture2D* inputColor = nullptr;
 			ID3D11Texture2D* sdrProxyTex = nullptr;
