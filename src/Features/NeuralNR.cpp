@@ -27,13 +27,6 @@ namespace
 
 	void* s_pfnReleaseFeature = nullptr;
 
-	// PATCH: checks the swap chain's actual negotiated output color space
-	// (real HDR10/PQ signal) instead of the backbuffer's pixel format. A
-	// float/10-bit backbuffer format is commonly used for internal rendering
-	// precision (bloom, tonemapping headroom) whether or not HDR output is
-	// actually active — checking the format alone was a false positive on a
-	// setup with HDR genuinely off everywhere (INI, NVIDIA App, Windows).
-	// Fails safe: returns false (SDR path) if any query along the way fails.
 	bool IsActuallyHDROutput(IDXGISwapChain* swapChain)
 	{
 		bool isHDR = false;
@@ -67,7 +60,7 @@ void NeuralNR::LoadDLL()
 {
 	auto& s = GetState();
 
-	// FIX: Load the core NVIDIA NGX SDK to get the function exports, NOT the payload DLL.
+	// Load the core NVIDIA NGX SDK to get the function exports
 	s.hDLL = LoadLibraryW(L"nvngx.dll");
 	if (!s.hDLL) s.hDLL = LoadLibraryW(L"_nvngx.dll");
 
@@ -83,6 +76,7 @@ void NeuralNR::LoadDLL()
 	s.pfnEvaluateFeature    = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
 	s.pfnDestroyParameters  = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_DestroyParameters");
 	s.pfnReleaseFeature     = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_ReleaseFeature");
+	s_pfnReleaseFeature     = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_ReleaseFeature");
 }
 
 bool NeuralNR::CheckGate()
@@ -189,16 +183,8 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 		return SUCCEEDED(dev->CreateUnorderedAccessView(t, &ud, out));
 	};
 
-	// PATCH: previously created a brand-new, separately allocated s.mvTex
-	// and never copied real motion vector data into it — NGX was being
-	// handed zeroed/garbage GPU memory every frame regardless of whether
-	// EvaluateFeature succeeded. Fixed by building a view directly onto
-	// Upscaling's own live motion-vector resource instead: it's refreshed
-	// every frame by Upscaling's own pipeline (the "copy" in its name),
-	// so a view onto it stays current with no copy step of our own —
-	// and using its real queried format instead of a guessed one.
 	auto tryCreateMotionVectorTexture = [&]() {
-		if (s.mvSRV) return; // already have a view
+		if (s.mvSRV) return;
 		if (auto* mv = globals::features::upscaling.motionVectorCopyTexture)
 		{
 			auto* raw = static_cast<ID3D11Texture2D*>(mv->resource.get());
@@ -318,20 +304,19 @@ void NeuralNR::OnPresent()
 	auto& s = GetState();
 	if (!s.initialized)
 	{
-		// LAZY INIT: Because the feature isn't registered in FeatureVersions.h yet,
-		// the engine never calls PostPostLoad(). We manually trigger it on Frame 1.
 		static bool s_setupAttempted = false;
 		if (!s_setupAttempted)
 		{
 			s_setupAttempted = true;
 			PostPostLoad();
 		}
-
-		if (!s.nrFeature && CreateFeature()) s.initialized = true;
-		if (!s.initialized) return;
 	}
 
-	if (!s.nrFeature || !s.nrParams || !s.pfnEvaluateFeature) return;
+	if (!s.pfnEvaluateFeature || !s.nrParams) 
+	{
+		settings.enabled = false;
+		return;
+	}
 
 	auto ctx = globals::d3d::context;
 	ID3D11Texture2D* back = nullptr;
@@ -343,19 +328,39 @@ void NeuralNR::OnPresent()
 
 	if (!s.inputColor || !s.nrOutputTex || !s.mvSRV || !s.depthSRV) { back->Release(); return; }
 
-	// PATCH: real HDR10/PQ output check (see IsActuallyHDROutput above),
-	// replacing the hardcoded `false` — checks the swap chain's negotiated
-	// color space instead of its storage format, so it correctly reads SDR
-	// when HDR is genuinely off everywhere, while still flipping true for a
-	// setup where HDR output is actually active.
+	auto* P = s.nrParams;
+
+	P->Set(NVSDK_NGX_Parameter_Width,  (int)w);
+	P->Set(NVSDK_NGX_Parameter_Height, (int)h);
+	
+	auto SetSubrect = [&](const char* name) {
+		P->Set((std::string(name) + "SubrectBaseX").c_str(), 0);
+		P->Set((std::string(name) + "SubrectBaseY").c_str(), 0);
+		P->Set((std::string(name) + "SubrectWidth").c_str(),  (int)w);
+		P->Set((std::string(name) + "SubrectHeight").c_str(), (int)h);
+	};
+	SetSubrect("DLSSNR.Color"); 
+	SetSubrect("DLSSNR.MVec");
+	SetSubrect("DLSSNR.Depth"); 
+	SetSubrect("DLSSNR.Output");
+
+	if (!s.initialized)
+	{
+		if (!s.nrFeature && CreateFeature()) {
+			s.initialized = true;
+		} else {
+			logger::error("NeuralNR: Feature creation permanently failed. Disabling to prevent log spam.");
+			settings.enabled = false;
+			back->Release();
+			return;
+		}
+	}
+
 	const bool hdr = IsActuallyHDROutput(globals::d3d::swapChain);
 
 	ctx->CopyResource(s.inputColor, back);
 	if (hdr) DispatchProxy();
 
-	auto* P = s.nrParams;
-	P->Set(NVSDK_NGX_Parameter_Width,  (int)w);
-	P->Set(NVSDK_NGX_Parameter_Height, (int)h);
 	P->Set("DLSSNR.Hint.Render.Preset", settings.preset);
 	P->Set("DLSSNR.Enabled", 1);
 	if (s.needsReset.exchange(false)) P->Set("DLSSNR.Reset", 1);
@@ -376,15 +381,6 @@ void NeuralNR::OnPresent()
 	P->Set("DLSSNR.MVec",   ResourceFromView(s.mvSRV));
 	P->Set("DLSSNR.Depth",  ResourceFromView(s.depthSRV));
 
-	auto SetSubrect = [&](const char* name) {
-		P->Set((std::string(name) + "SubrectBaseX").c_str(), 0);
-		P->Set((std::string(name) + "SubrectBaseY").c_str(), 0);
-		P->Set((std::string(name) + "SubrectWidth").c_str(),  (int)w);
-		P->Set((std::string(name) + "SubrectHeight").c_str(), (int)h);
-	};
-	SetSubrect("DLSSNR.Color"); SetSubrect("DLSSNR.MVec");
-	SetSubrect("DLSSNR.Depth"); SetSubrect("DLSSNR.Output");
-
 	NVSDK_NGX_Result evalRes = ((PFN_EvaluateFeature)s.pfnEvaluateFeature)(
 		ctx, s.nrFeature, P, nullptr);
 
@@ -396,16 +392,9 @@ void NeuralNR::OnPresent()
 	}
 	else if (!NVSDK_NGX_SUCCEED(evalRes))
 	{
-		// PATCH: throttled failure logging — was previously unconditional
-		// every frame, which floods the log at 60+ fps during exactly the
-		// debugging session where you need it readable. Now logs
-		// immediately on the first failure, immediately again if the
-		// result code changes (a different problem than before), and
-		// otherwise re-logs periodically as a "still failing" heartbeat
-		// instead of every single frame.
 		static NVSDK_NGX_Result s_lastLoggedFailure = static_cast<NVSDK_NGX_Result>(-1);
 		static uint32_t s_failureLogFrameCounter = 0;
-		constexpr uint32_t kFailureLogIntervalFrames = 300; // ~5s at 60fps
+		constexpr uint32_t kFailureLogIntervalFrames = 300; 
 
 		const bool isNewFailureCode = (evalRes != s_lastLoggedFailure);
 		++s_failureLogFrameCounter;
@@ -438,7 +427,6 @@ void NeuralNR::PostPostLoad()
 	if (!CompileShaders())
 	{ logger::info("NeuralNR: shader compile failed"); return; }
 
-	// Point NGX to the folder containing the DLSS NR payload (nvngx_dlssnr.dll)
 	std::wstring appPath = Util::PathHelpers::GetFeatureShaderPath("NeuralNR").wstring();
 	std::wstring dllSearchPath = appPath;
 
@@ -447,7 +435,6 @@ void NeuralNR::PostPostLoad()
 		dllSearchPath = (Util::PathHelpers::GetShadersPath() / L"Upscaling" / L"Streamline").wstring();
 	}
 
-	// Tell the NVIDIA SDK explicitly where to search for the payload DLL
 	const wchar_t* searchPaths[] = { dllSearchPath.c_str() };
 	
 	NVSDK_NGX_FeatureCommonInfo featureInfo{};
@@ -465,6 +452,7 @@ void NeuralNR::PostPostLoad()
 	if (!NVSDK_NGX_SUCCEED(initRes))
 	{ 
 		logger::warn("NeuralNR: Init_Ext failed with result code: 0x{:X}", static_cast<uint32_t>(initRes)); 
+		return;
 	}
 
 	if (!s.pfnAllocateParameters)
