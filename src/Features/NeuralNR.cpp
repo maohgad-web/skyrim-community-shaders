@@ -440,16 +440,25 @@ void NeuralNR::PostPostLoad()
 
 	// Point NGX to the folder containing the DLSS NR payload (nvngx_dlssnr.dll)
 	std::wstring appPath = Util::PathHelpers::GetFeatureShaderPath("NeuralNR").wstring();
+	std::wstring dllSearchPath = appPath;
+
 	if (!std::filesystem::exists(Util::PathHelpers::GetFeatureShaderPath("NeuralNR") / L"nvngx_dlssnr.dll"))
 	{
-		appPath = (Util::PathHelpers::GetShadersPath() / L"Upscaling" / L"Streamline").wstring();
+		dllSearchPath = (Util::PathHelpers::GetShadersPath() / L"Upscaling" / L"Streamline").wstring();
 	}
+
+	// Tell the NVIDIA SDK explicitly where to search for the payload DLL
+	const wchar_t* searchPaths[] = { dllSearchPath.c_str() };
+	
+	NVSDK_NGX_FeatureCommonInfo featureInfo{};
+	featureInfo.PathListInfo = searchPaths;
+	featureInfo.PathListInfoCount = 1;
 
 	NVSDK_NGX_Result initRes = ((PFN_InitExt)s.pfnInitExt)(
 		0x1337ULL, 
 		appPath.c_str(), 
 		globals::d3d::device, 
-		nullptr, 
+		&featureInfo,
 		NVSDK_NGX_Version_API
 	);
 
