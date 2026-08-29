@@ -7,10 +7,12 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
+#include <dxgi1_6.h>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <filesystem>
+#include <imgui.h>
 
 namespace
 {
@@ -23,7 +25,33 @@ namespace
 	using PFN_ReleaseFeature     = decltype(&NVSDK_NGX_D3D11_ReleaseFeature);
 	using PFN_DestroyParams      = decltype(&NVSDK_NGX_D3D11_DestroyParameters);
 
-	void* s_pfnReleaseFeature = nullptr; 
+	void* s_pfnReleaseFeature = nullptr;
+
+	// PATCH: checks the swap chain's actual negotiated output color space
+	// (real HDR10/PQ signal) instead of the backbuffer's pixel format. A
+	// float/10-bit backbuffer format is commonly used for internal rendering
+	// precision (bloom, tonemapping headroom) whether or not HDR output is
+	// actually active — checking the format alone was a false positive on a
+	// setup with HDR genuinely off everywhere (INI, NVIDIA App, Windows).
+	// Fails safe: returns false (SDR path) if any query along the way fails.
+	bool IsActuallyHDROutput(IDXGISwapChain* swapChain)
+	{
+		bool isHDR = false;
+		IDXGIOutput* output = nullptr;
+		if (swapChain && SUCCEEDED(swapChain->GetContainingOutput(&output)) && output)
+		{
+			IDXGIOutput6* output6 = nullptr;
+			if (SUCCEEDED(output->QueryInterface(IID_PPV_ARGS(&output6))))
+			{
+				DXGI_OUTPUT_DESC1 desc1{};
+				if (SUCCEEDED(output6->GetDesc1(&desc1)))
+					isHDR = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+				output6->Release();
+			}
+			output->Release();
+		}
+		return isHDR;
+	}
 }
 
 ID3D11Resource* NeuralNR::ResourceFromView(ID3D11View* view) const
@@ -31,23 +59,22 @@ ID3D11Resource* NeuralNR::ResourceFromView(ID3D11View* view) const
 	if (!view) return nullptr;
 	ID3D11Resource* res = nullptr;
 	view->GetResource(&res);
-	if (res) res->Release(); 
+	if (res) res->Release();
 	return res;
 }
 
 void NeuralNR::LoadDLL()
 {
 	auto& s = GetState();
-	
-	// Check feature folder first, fallback to Streamline folder if missing
+
 	auto path = Util::PathHelpers::GetFeatureShaderPath("NeuralNR") / L"nvngx_dlssnr.dll";
-	if (!std::filesystem::exists(path)) 
+	if (!std::filesystem::exists(path))
 	{
 		path = Util::PathHelpers::GetShadersPath() / L"Upscaling" / L"Streamline" / L"nvngx_dlssnr.dll";
 	}
 
 	s.hDLL = LoadLibraryW(path.c_str());
-	if (!s.hDLL) 
+	if (!s.hDLL)
 	{
 		logger::warn("NeuralNR: Could not find nvngx_dlssnr.dll at {}", path.string());
 		return;
@@ -87,7 +114,7 @@ bool NeuralNR::CompileShaders()
 {
 	auto& s = GetState();
 	auto dir = Util::PathHelpers::GetShadersPath();
-	
+
 	auto compile = [&](const char* file, const char* entry, ID3D11ComputeShader** out) {
 		std::ifstream f(dir / file, std::ios::binary);
 		if (!f) { logger::warn("NeuralNR: missing shader {}", file); return false; }
@@ -102,7 +129,7 @@ bool NeuralNR::CompileShaders()
 		blob->Release();
 		return SUCCEEDED(hr) && *out;
 	};
-	
+
 	return compile("NeuralNR_SDRProxy.hlsl", "CS_GenerateSDRProxy", &s.proxyCS)
 		&& compile("NeuralNR_Transfer.hlsl", "CS_TransferEditToHDR", &s.transferCS);
 }
@@ -110,15 +137,13 @@ bool NeuralNR::CompileShaders()
 bool NeuralNR::CreateFeature()
 {
 	auto& s = GetState();
-	
-	// PATCH: Safety guard to prevent null pointer dereference crash
 	if (!s.pfnCreateFeature || !s.nrParams) return false;
 
 	CSS::CallerSpoof::Install();
 	NVSDK_NGX_Result res = ((PFN_CreateFeature)s.pfnCreateFeature)(
 		globals::d3d::context, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), s.nrParams, &s.nrFeature);
 	CSS::CallerSpoof::Uninstall();
-	
+
 	if (!NVSDK_NGX_SUCCEED(res) || !s.nrFeature)
 	{
 		logger::error("NeuralNR: CreateFeature failed, res=0x{:X}", static_cast<uint32_t>(res));
@@ -155,7 +180,7 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 	};
 
 	auto tryCreateMotionVectorTexture = [&]() {
-		if (s.mvTex) return; 
+		if (s.mvTex) return;
 		if (auto* mv = globals::features::upscaling.motionVectorCopyTexture)
 		{
 			auto* raw = static_cast<ID3D11Texture2D*>(mv->resource.get());
@@ -201,9 +226,8 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 			if (SUCCEEDED(dres->QueryInterface(IID_PPV_ARGS(&dtex))))
 			{
 				D3D11_TEXTURE2D_DESC dd{}; dtex->GetDesc(&dd);
-				logger::info("NeuralNR: Skyrim Depth Format: 0x{:X}", static_cast<uint32_t>(dd.Format));
 				D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-				sd.Format = DXGI_FORMAT_R32_FLOAT; 
+				sd.Format = DXGI_FORMAT_R32_FLOAT;
 				sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sd.Texture2D.MipLevels = 1;
 				if (FAILED(dev->CreateShaderResourceView(dtex, &sd, &s.depthSRV)))
 					logger::warn("NeuralNR: depth SRV (R32_FLOAT override) failed");
@@ -270,6 +294,8 @@ void NeuralNR::DispatchTransfer()
 
 void NeuralNR::OnPresent()
 {
+	if (!settings.enabled) return;
+
 	auto& s = GetState();
 	if (!s.initialized)
 	{
@@ -277,7 +303,6 @@ void NeuralNR::OnPresent()
 		if (!s.initialized) return;
 	}
 
-	// PATCH: Final safety guard to guarantee no null exceptions during rendering loop
 	if (!s.nrFeature || !s.nrParams || !s.pfnEvaluateFeature) return;
 
 	auto ctx = globals::d3d::context;
@@ -287,10 +312,15 @@ void NeuralNR::OnPresent()
 	const uint32_t w = dsc.Width, h = dsc.Height;
 	if (s.w != w || s.h != h) s.needsReset = true;
 	CreateResources(w, h, dsc.Format);
-	
+
 	if (!s.inputColor || !s.nrOutputTex || !s.mvTex || !s.depthSRV) { back->Release(); return; }
-	const bool hdr = (dsc.Format == DXGI_FORMAT_R10G10B10A2_UNORM)
-		|| (dsc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+
+	// PATCH: real HDR10/PQ output check (see IsActuallyHDROutput above),
+	// replacing the hardcoded `false` — checks the swap chain's negotiated
+	// color space instead of its storage format, so it correctly reads SDR
+	// when HDR is genuinely off everywhere, while still flipping true for a
+	// setup where HDR output is actually active.
+	const bool hdr = IsActuallyHDROutput(globals::d3d::swapChain);
 
 	ctx->CopyResource(s.inputColor, back);
 	if (hdr) DispatchProxy();
@@ -329,8 +359,37 @@ void NeuralNR::OnPresent()
 
 	NVSDK_NGX_Result evalRes = ((PFN_EvaluateFeature)s.pfnEvaluateFeature)(
 		ctx, s.nrFeature, P, nullptr);
-	if (!NVSDK_NGX_SUCCEED(evalRes))
-	{ logger::warn("NeuralNR: EvaluateFeature failed, res=0x{:X}", static_cast<uint32_t>(evalRes)); back->Release(); return; }
+
+	static bool s_loggedEval = false;
+	if (NVSDK_NGX_SUCCEED(evalRes) && !s_loggedEval)
+	{
+		logger::info("NeuralNR: First frame evaluated successfully! Format=0x{:X}", static_cast<uint32_t>(dsc.Format));
+		s_loggedEval = true;
+	}
+	else if (!NVSDK_NGX_SUCCEED(evalRes))
+	{
+		// PATCH: throttled failure logging — was previously unconditional
+		// every frame, which floods the log at 60+ fps during exactly the
+		// debugging session where you need it readable. Now logs
+		// immediately on the first failure, immediately again if the
+		// result code changes (a different problem than before), and
+		// otherwise re-logs periodically as a "still failing" heartbeat
+		// instead of every single frame.
+		static NVSDK_NGX_Result s_lastLoggedFailure = static_cast<NVSDK_NGX_Result>(-1);
+		static uint32_t s_failureLogFrameCounter = 0;
+		constexpr uint32_t kFailureLogIntervalFrames = 300; // ~5s at 60fps
+
+		const bool isNewFailureCode = (evalRes != s_lastLoggedFailure);
+		++s_failureLogFrameCounter;
+		if (isNewFailureCode || s_failureLogFrameCounter >= kFailureLogIntervalFrames)
+		{
+			logger::warn("NeuralNR: EvaluateFeature failed, res=0x{:X}", static_cast<uint32_t>(evalRes));
+			s_lastLoggedFailure = evalRes;
+			s_failureLogFrameCounter = 0;
+		}
+		back->Release();
+		return;
+	}
 
 	if (hdr) { DispatchTransfer(); ctx->CopyResource(back, s.transferOut); }
 	else     { ctx->CopyResource(back, s.nrOutputTex); }
@@ -347,15 +406,15 @@ void NeuralNR::PostPostLoad()
 	{ logger::info("NeuralNR: gate failed — disabled"); return; }
 	if (!CompileShaders())
 	{ logger::info("NeuralNR: shader compile failed"); return; }
-	
+
 	if (!NVSDK_NGX_SUCCEED(((PFN_InitExt)s.pfnInitExt)(0x1337ULL, L"", globals::d3d::device, nullptr, NVSDK_NGX_Version_API)))
 	{ logger::info("NeuralNR: Init_Ext failed"); return; }
-	
+
 	if (!s.pfnAllocateParameters)
 	{ logger::info("NeuralNR: AllocateParameters export missing"); return; }
-	
+
 	((PFN_AllocParams)s.pfnAllocateParameters)(&s.nrParams);
-	
+
 	if (!s.nrParams)
 	{ logger::info("NeuralNR: AllocateParameters failed"); return; }
 	logger::info("NeuralNR: ready to create feature");
@@ -363,6 +422,41 @@ void NeuralNR::PostPostLoad()
 
 void NeuralNR::Reset() { GetState().needsReset = true; }
 
-void NeuralNR::DrawSettings()  { /* CALIBRATE: wire CSS ImGui sliders to settings */ }
-void NeuralNR::LoadSettings(json&)  { /* CALIBRATE: read the "NeuralNR" section */ }
-void NeuralNR::SaveSettings(json&)  { /* CALIBRATE: write the "NeuralNR" section */ }
+void NeuralNR::DrawSettings()
+{
+	ImGui::Checkbox("Enable DLSS Neural NR", &settings.enabled);
+
+	if (settings.enabled)
+	{
+		ImGui::Separator();
+		ImGui::SliderFloat("Intensity", &settings.intensity, 0.0f, 2.0f, "%.2f");
+		ImGui::SliderFloat("Local Tone Strength", &settings.localTone, 0.0f, 1.0f, "%.2f");
+		ImGui::SliderFloat("Local Structure", &settings.localStructure, 0.0f, 1.0f, "%.2f");
+		ImGui::SliderFloat("Skin Structure", &settings.skinStructure, 0.0f, 1.0f, "%.2f");
+		ImGui::Checkbox("Auto Mask", reinterpret_cast<bool*>(&settings.useAutoMask));
+	}
+}
+
+void NeuralNR::LoadSettings(json& o_json)
+{
+	if (o_json.contains("NeuralNR") && !o_json["NeuralNR"].is_null())
+	{
+		auto& j = o_json["NeuralNR"];
+		settings.enabled = j.value("enabled", false);
+		settings.intensity = j.value("intensity", 1.0f);
+		settings.localTone = j.value("localTone", 0.5f);
+		settings.localStructure = j.value("localStructure", 0.5f);
+		settings.skinStructure = j.value("skinStructure", 0.5f);
+		settings.useAutoMask = j.value("useAutoMask", true);
+	}
+}
+
+void NeuralNR::SaveSettings(json& o_json)
+{
+	o_json["NeuralNR"]["enabled"] = settings.enabled;
+	o_json["NeuralNR"]["intensity"] = settings.intensity;
+	o_json["NeuralNR"]["localTone"] = settings.localTone;
+	o_json["NeuralNR"]["localStructure"] = settings.localStructure;
+	o_json["NeuralNR"]["skinStructure"] = settings.skinStructure;
+	o_json["NeuralNR"]["useAutoMask"] = settings.useAutoMask;
+}
