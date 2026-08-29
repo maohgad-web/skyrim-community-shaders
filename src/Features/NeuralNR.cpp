@@ -105,7 +105,6 @@ bool NeuralNR::CheckGate()
 	adp1->GetDesc1(&d);
 	adp1->Release();
 	if (d.VendorId != 0x10DE) return false;
-	if (!(d.DeviceId >= 0x2B00 && d.DeviceId <= 0x2BFF)) return false;
 	if (globals::features::upscaling.GetUpscaleMethod() != Upscaling::UpscaleMethod::kDLSS) return false;
 	return true;
 }
