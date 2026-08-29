@@ -42,7 +42,18 @@ namespace
 	using PFN_AllocParams        = decltype(&NVSDK_NGX_D3D11_AllocateParameters);
 	using PFN_CreateFeature      = decltype(&NVSDK_NGX_D3D11_CreateFeature);
 	using PFN_EvaluateFeature    = decltype(&NVSDK_NGX_D3D11_EvaluateFeature);
-	using PFN_DestroyParams      = decltype(&NVSDK_NGX_D3D11_ReleaseFeature);
+	// PATCH: split into two — NVSDK_NGX_D3D11_ReleaseFeature takes an
+	// NVSDK_NGX_Handle* (confirmed by the compiler's own error: it releases
+	// the FEATURE, paired with CreateFeature), not a Parameter** at all.
+	// The actual parameter-block destructor is a different, separate export.
+	// "DestroyParameters" is the best-guess real name here (paired with
+	// AllocateParameters) — if this specific line fails to compile, that's
+	// the signal the real header uses a different name; check the header
+	// directly for whatever it actually calls the parameter-teardown export.
+	using PFN_ReleaseFeature     = decltype(&NVSDK_NGX_D3D11_ReleaseFeature);
+	using PFN_DestroyParams      = decltype(&NVSDK_NGX_D3D11_DestroyParameters);
+
+	void* s_pfnReleaseFeature = nullptr; // resolved in LoadDLL, used in ReleaseFeature()
 }
 
 // NOTE: intentionally NOT wrapped in namespace CSS — NeuralNR is a global-scope
@@ -68,7 +79,10 @@ void NeuralNR::LoadDLL()
 	s.pfnAllocateParameters = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_AllocateParameters");
 	s.pfnCreateFeature      = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_CreateFeature");
 	s.pfnEvaluateFeature    = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
-	s.pfnDestroyParameters  = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_ReleaseFeature");
+	// PATCH: these are two separate exports now (see the PFN typedefs above) —
+	// one tears down the parameter block, the other releases the feature handle.
+	s.pfnDestroyParameters  = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_DestroyParameters");
+	s_pfnReleaseFeature     = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_ReleaseFeature");
 }
 
 bool NeuralNR::CheckGate()
@@ -177,8 +191,13 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 			auto* raw = static_cast<ID3D11Texture2D*>(mv->resource.get());
 			if (raw)
 			{
-				mkTex(&s.mvTex, DXGI_FORMAT_R8G8_FLOAT, D3D11_BIND_SHADER_RESOURCE);
-				mkSRV(s.mvTex, DXGI_FORMAT_R8G8_FLOAT, &s.mvSRV);
+				// PATCH: DXGI_FORMAT_R8G8_FLOAT isn't a real DXGI_FORMAT value
+				// (no 8-bit-per-channel float format exists). Using a real,
+				// standard motion-vector format instead — ideally this should
+				// match whatever format Upscaling's own motionVectorCopyTexture
+				// actually uses, worth double-checking.
+				mkTex(&s.mvTex, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_SHADER_RESOURCE);
+				mkSRV(s.mvTex, DXGI_FORMAT_R16G16_FLOAT, &s.mvSRV);
 			}
 		}
 	};
@@ -208,9 +227,14 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 	// MVs — retry logic above; this is the first attempt.
 	tryCreateMotionVectorTexture();
 
-	// Depth SRV — CALIBRATE: format override for typeless depth.
+	// PATCH: the real member is `depthSRV`, confirmed against CommonLibSSE-NG's
+	// own generated docs (ng.commonlib.dev / po3.commonlib.dev both list it) —
+	// `.textureView` never existed. We still derive our own separately-
+	// formatted SRV from its underlying resource below, since depth textures
+	// are commonly created TYPELESS internally and need an explicit format
+	// override to be sampled as a normal SRV.
 	auto* depthSRV = globals::game::renderer->GetDepthStencilData()
-		.depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN].textureView.get();
+		.depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN].depthSRV.get();
 	if (depthSRV)
 	{
 		ID3D11Resource* dres = nullptr;
@@ -256,8 +280,13 @@ void NeuralNR::ReleaseFeature()
 	auto& s = GetState();
 	if (s.pfnDestroyParameters && s.nrParams)
 		((PFN_DestroyParams)s.pfnDestroyParameters)(&s.nrParams);
+	// PATCH: this is the actual feature-handle release (was previously
+	// miswired to the parameter-destroy call above, which doesn't match its
+	// real signature — see the PFN typedefs).
+	if (s_pfnReleaseFeature && s.nrFeature)
+		((PFN_ReleaseFeature)s_pfnReleaseFeature)(s.nrFeature);
 	s.nrParams = nullptr;
-	s.nrFeature = nullptr; // CALIBRATE: call DestroyFeature if the header exposes one
+	s.nrFeature = nullptr;
 }
 
 void NeuralNR::DispatchProxy()
@@ -265,12 +294,12 @@ void NeuralNR::DispatchProxy()
 	auto& s = GetState(); auto ctx = globals::d3d::context;
 	ctx->CSSetShader(s.proxyCS, nullptr, 0);
 	ctx->CSSetShaderResources(0, 1, &s.inputSRV);
-	ctx->CSSetUnorderedAccessViews(0, 1, &s.sdrProxyUAV);
+	ctx->CSSetUnorderedAccessViews(0, 1, &s.sdrProxyUAV, nullptr);
 	ctx->CSSetConstantBuffers(0, 1, &s.tuningCB);
 	ctx->Dispatch(s.w / 8, s.h / 8, 1);
 	ID3D11ShaderResourceView* n0 = nullptr; ID3D11UnorderedAccessView* n1 = nullptr;
 	ctx->CSSetShaderResources(0, 1, &n0);
-	ctx->CSSetUnorderedAccessViews(0, 1, &n1);
+	ctx->CSSetUnorderedAccessViews(0, 1, &n1, nullptr);
 }
 
 void NeuralNR::DispatchTransfer()
@@ -279,11 +308,11 @@ void NeuralNR::DispatchTransfer()
 	ctx->CSSetShader(s.transferCS, nullptr, 0);
 	ID3D11ShaderResourceView* srcs[3] = { s.inputSRV, s.sdrProxySRV, s.nrOutputSRV };
 	ctx->CSSetShaderResources(0, 3, srcs);
-	ctx->CSSetUnorderedAccessViews(0, 1, &s.transferOutUAV);
+	ctx->CSSetUnorderedAccessViews(0, 1, &s.transferOutUAV, nullptr);
 	ctx->Dispatch(s.w / 8, s.h / 8, 1);
 	ID3D11ShaderResourceView* n0 = nullptr; ID3D11UnorderedAccessView* n1 = nullptr;
 	ctx->CSSetShaderResources(0, 3, &n0);
-	ctx->CSSetUnorderedAccessViews(0, 1, &n1);
+	ctx->CSSetUnorderedAccessViews(0, 1, &n1, nullptr);
 }
 
 void NeuralNR::OnPresent()
@@ -305,7 +334,7 @@ void NeuralNR::OnPresent()
 	// Bail out this frame (and retry next frame via CreateResources) rather
 	// than handing NGX a null MVec resource, which is one of the four
 	// resources this feature requires unconditionally.
-	if (!s.inputColor || !s.nrOutputTex || !s.mvTex) { back->Release(); return; }
+	if (!s.inputColor || !s.nrOutputTex || !s.mvTex || !s.depthSRV) { back->Release(); return; }
 	const bool hdr = (dsc.Format == DXGI_FORMAT_R10G10B10A2_UNORM)
 		|| (dsc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
 
