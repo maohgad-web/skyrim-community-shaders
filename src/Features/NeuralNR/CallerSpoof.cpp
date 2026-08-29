@@ -4,17 +4,9 @@
 
 #pragma intrinsic(_ReturnAddress)
 
-// NOTE: no <detours/detours.h> include here on purpose — include/PCH.h is
-// force-included into every TU and already pulls in raw MS Detours
-// (DetourTransactionBegin/Attach/Detach/Commit), same as the PCH's own
-// detour_thunk.
-
 namespace CSS::CallerSpoof
 {
 	using GetModuleFileNameW_t = DWORD(WINAPI*)(HMODULE, LPWSTR, DWORD);
-	// Doubles as the Detours trampoline: after a successful DetourAttach,
-	// s_origK32/s_origKB point at the generated trampoline that forwards to
-	// the real GetModuleFileNameW, which is what HookedK32/HookedKB call.
 	static GetModuleFileNameW_t s_origK32 = nullptr;
 	static GetModuleFileNameW_t s_origKB  = nullptr;
 	static HMODULE              s_ourModule = nullptr;
@@ -69,27 +61,38 @@ namespace CSS::CallerSpoof
 	{
 		if (s_origK32 || s_origKB) return;
 
-		// Our own module: the one NGX's GetModuleHandleExW(FROM_ADDRESS)
-		// resolves to when WE (the SCS plugin) call into the NGX DLLs.
+		// Resolve our own module handle for comparison
 		GetModuleHandleExW(
 			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
 			reinterpret_cast<LPCWSTR>(&Install),
 			&s_ourModule);
 
-		// Two separate transactions on purpose: on modern Windows
-		// kernel32!GetModuleFileNameW is a forwarder stub to kernelbase, so
-		// the first attach may already patch the same real function the
-		// second one targets. Keeping them separate means a second-attach
-		// failure (already-patched target) cannot roll back the first.
-		DetourTransactionBegin();
-		DetourUpdateThread(GetCurrentThread());
-		DetourAttach((PVOID*)&s_origK32, (PVOID)HookedK32);
-		DetourTransactionCommit();
+		// Obtain the function pointers BEFORE attaching the detours
+		HMODULE hK32 = GetModuleHandleW(L"kernel32.dll");
+		HMODULE hKB  = GetModuleHandleW(L"kernelbase.dll");
 
-		DetourTransactionBegin();
-		DetourUpdateThread(GetCurrentThread());
-		DetourAttach((PVOID*)&s_origKB, (PVOID)HookedKB);
-		DetourTransactionCommit();
+		if (hK32)
+			s_origK32 = reinterpret_cast<GetModuleFileNameW_t>(GetProcAddress(hK32, "GetModuleFileNameW"));
+		if (hKB)
+			s_origKB  = reinterpret_cast<GetModuleFileNameW_t>(GetProcAddress(hKB, "GetModuleFileNameW"));
+
+		// Hook kernel32!GetModuleFileNameW
+		if (s_origK32)
+		{
+			DetourTransactionBegin();
+			DetourUpdateThread(GetCurrentThread());
+			DetourAttach(reinterpret_cast<PVOID*>(&s_origK32), reinterpret_cast<PVOID>(HookedK32));
+			DetourTransactionCommit();
+		}
+
+		// Hook kernelbase!GetModuleFileNameW
+		if (s_origKB)
+		{
+			DetourTransactionBegin();
+			DetourUpdateThread(GetCurrentThread());
+			DetourAttach(reinterpret_cast<PVOID*>(&s_origKB), reinterpret_cast<PVOID>(HookedKB));
+			DetourTransactionCommit();
+		}
 
 		logger::info("NeuralNR: caller-spoof installed (kernel32={}, kernelbase={}).",
 			s_origK32 ? "ok" : "skipped", s_origKB ? "ok" : "skipped");
@@ -101,7 +104,7 @@ namespace CSS::CallerSpoof
 		{
 			DetourTransactionBegin();
 			DetourUpdateThread(GetCurrentThread());
-			DetourDetach((PVOID*)&s_origK32, (PVOID)HookedK32);
+			DetourDetach(reinterpret_cast<PVOID*>(&s_origK32), reinterpret_cast<PVOID>(HookedK32));
 			DetourTransactionCommit();
 			s_origK32 = nullptr;
 		}
@@ -109,7 +112,7 @@ namespace CSS::CallerSpoof
 		{
 			DetourTransactionBegin();
 			DetourUpdateThread(GetCurrentThread());
-			DetourDetach((PVOID*)&s_origKB, (PVOID)HookedKB);
+			DetourDetach(reinterpret_cast<PVOID*>(&s_origKB), reinterpret_cast<PVOID>(HookedKB));
 			DetourTransactionCommit();
 			s_origKB = nullptr;
 		}
