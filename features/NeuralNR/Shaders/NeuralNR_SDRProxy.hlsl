@@ -22,6 +22,11 @@ float3 SRGBEncode(float3 c)
 [numthreads(8, 8, 1)]
 void CS_GenerateSDRProxy(uint3 DTid : SV_DispatchThreadID)
 {
+    uint width, height;
+    HDRInput.GetDimensions(width, height);
+    if (DTid.x >= width || DTid.y >= height)
+        return;
+
     float4 hdr = HDRInput[DTid.xy];
     float3 sdr = hdr.rgb * (80.0f / max(NRPaperWhiteNits, 1.0f));
     sdr = SRGBEncode(sdr) * NREncodeStrength;

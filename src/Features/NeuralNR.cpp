@@ -117,14 +117,28 @@ bool NeuralNR::CompileShaders()
 	auto compile = [&](const char* file, const char* entry, ID3D11ComputeShader** out) {
 		std::ifstream f(dir / file, std::ios::binary);
 		if (!f) { logger::warn("NeuralNR: missing shader {}", file); return false; }
+		
 		std::stringstream ss; ss << f.rdbuf();
 		auto src = ss.str();
+		
 		ID3DBlob* blob = nullptr;
+		ID3DBlob* errorBlob = nullptr;
+		
 		if (FAILED(D3DCompile(src.c_str(), src.size(), file, nullptr,
-			D3D_COMPILE_STANDARD_FILE_INCLUDE, entry, "cs_6_0", 0, 0, &blob, nullptr)))
-		{ logger::warn("NeuralNR: D3DCompile failed for {}", file); return false; }
+			D3D_COMPILE_STANDARD_FILE_INCLUDE, entry, "cs_5_0", 0, 0, &blob, &errorBlob)))
+		{ 
+			if (errorBlob) {
+				logger::warn("NeuralNR: D3DCompile failed for {}\nCompiler Output:\n{}", file, static_cast<const char*>(errorBlob->GetBufferPointer()));
+				errorBlob->Release();
+			} else {
+				logger::warn("NeuralNR: D3DCompile failed for {} (No error blob generated)", file); 
+			}
+			return false; 
+		}
+		
 		auto hr = globals::d3d::device->CreateComputeShader(
 			blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, out);
+			
 		blob->Release();
 		return SUCCEEDED(hr) && *out;
 	};
@@ -281,7 +295,7 @@ void NeuralNR::DispatchProxy()
 	ctx->CSSetShaderResources(0, 1, &s.inputSRV);
 	ctx->CSSetUnorderedAccessViews(0, 1, &s.sdrProxyUAV, nullptr);
 	ctx->CSSetConstantBuffers(0, 1, &s.tuningCB);
-	ctx->Dispatch(s.w / 8, s.h / 8, 1);
+	ctx->Dispatch((s.w + 7) / 8, (s.h + 7) / 8, 1);
 	ID3D11ShaderResourceView* n0 = nullptr; ID3D11UnorderedAccessView* n1 = nullptr;
 	ctx->CSSetShaderResources(0, 1, &n0);
 	ctx->CSSetUnorderedAccessViews(0, 1, &n1, nullptr);
@@ -294,7 +308,7 @@ void NeuralNR::DispatchTransfer()
 	ID3D11ShaderResourceView* srcs[3] = { s.inputSRV, s.sdrProxySRV, s.nrOutputSRV };
 	ctx->CSSetShaderResources(0, 3, srcs);
 	ctx->CSSetUnorderedAccessViews(0, 1, &s.transferOutUAV, nullptr);
-	ctx->Dispatch(s.w / 8, s.h / 8, 1);
+	ctx->Dispatch((s.w + 7) / 8, (s.h + 7) / 8, 1);
 	ID3D11ShaderResourceView* n0 = nullptr; ID3D11UnorderedAccessView* n1 = nullptr;
 	ctx->CSSetShaderResources(0, 3, &n0);
 	ctx->CSSetUnorderedAccessViews(0, 1, &n1, nullptr);

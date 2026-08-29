@@ -1,5 +1,5 @@
 // Inverse pass: transfer the neural edit (computed on the SDR proxy) back
-// onto the HDR frame. MODEL — not the verified RenoDX UpgradeToneMap.
+// onto the HDR frame.
 // Reads: original HDR, pre-NR sRGB proxy, post-NR result. Applies the
 // per-pixel edit as a clamped gain ratio to the HDR frame.
 
@@ -20,6 +20,11 @@ float3 SRGBDecode(float3 c)
 [numthreads(8, 8, 1)]
 void CS_TransferEditToHDR(uint3 DTid : SV_DispatchThreadID)
 {
+    uint width, height;
+    HDRInput.GetDimensions(width, height);
+    if (DTid.x >= width || DTid.y >= height)
+        return;
+
     float4   hdr    = HDRInput[DTid.xy];
     float3   linIn  = SRGBDecode(SDRProxyIn[DTid.xy].rgb);
     float3   linOut = SRGBDecode(SDRProxyOut[DTid.xy].rgb);
