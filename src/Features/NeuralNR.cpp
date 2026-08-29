@@ -74,14 +74,15 @@ bool NeuralNR::CompileShaders()
 {
 	auto& s = GetState();
 	auto dir = Util::PathHelpers::GetShadersPath();
-	auto compile = [&](const std::wstring& file, const char* entry, ID3D11ComputeShader** out) {
+	
+	// PATCH: Changed input parameters to narrow strings (const char*)
+	auto compile = [&](const char* file, const char* entry, ID3D11ComputeShader** out) {
 		std::ifstream f(dir / file, std::ios::binary);
 		if (!f) { logger::warn("NeuralNR: missing shader {}", file); return false; }
 		std::stringstream ss; ss << f.rdbuf();
 		auto src = ss.str();
 		ID3DBlob* blob = nullptr;
-		// PATCH: Fixed macro syntax for default standard file includes
-		if (FAILED(D3DCompile(src.c_str(), src.size(), file.c_str(), nullptr,
+		if (FAILED(D3DCompile(src.c_str(), src.size(), file, nullptr,
 			D3D_COMPILE_STANDARD_FILE_INCLUDE, entry, "cs_6_0", 0, 0, &blob, nullptr)))
 		{ logger::warn("NeuralNR: D3DCompile failed for {}", file); return false; }
 		auto hr = globals::d3d::device->CreateComputeShader(
@@ -89,8 +90,10 @@ bool NeuralNR::CompileShaders()
 		blob->Release();
 		return SUCCEEDED(hr) && *out;
 	};
-	return compile(L"NeuralNR_SDRProxy.hlsl", "CS_GenerateSDRProxy", &s.proxyCS)
-		&& compile(L"NeuralNR_Transfer.hlsl", "CS_TransferEditToHDR", &s.transferCS);
+	
+	// PATCH: Passed standard narrow strings for proper compiling
+	return compile("NeuralNR_SDRProxy.hlsl", "CS_GenerateSDRProxy", &s.proxyCS)
+		&& compile("NeuralNR_Transfer.hlsl", "CS_TransferEditToHDR", &s.transferCS);
 }
 
 bool NeuralNR::CreateFeature()
@@ -137,7 +140,8 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 
 	auto tryCreateMotionVectorTexture = [&]() {
 		if (s.mvTex) return; 
-		if (auto* mv = globals::features::upscaling.motionVectorCopyTexture.get())
+		// PATCH: Removed invalid .get() call since motionVectorCopyTexture is a raw Texture2D pointer
+		if (auto* mv = globals::features::upscaling.motionVectorCopyTexture)
 		{
 			auto* raw = static_cast<ID3D11Texture2D*>(mv->resource.get());
 			if (raw)
@@ -170,9 +174,9 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 
 	tryCreateMotionVectorTexture();
 
-	// PATCH: Fixed RE::RENDER_TARGET_DEPTHSTENCIL spelling for CommonLibSSE wrapper enum
+	// PATCH: Restored plural "S" to TARGETS
 	auto* depthSRV = globals::game::renderer->GetDepthStencilData()
-		.depthStencils[RE::RENDER_TARGET_DEPTHSTENCIL::kMAIN].depthSRV.get();
+		.depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN].depthSRV.get();
 	if (depthSRV)
 	{
 		ID3D11Resource* dres = nullptr;
@@ -217,7 +221,6 @@ void NeuralNR::ReleaseFeature()
 {
 	auto& s = GetState();
 	if (s.pfnDestroyParameters && s.nrParams)
-		// PATCH: Send the parameter block pointer itself, not its memory address
 		((PFN_DestroyParams)s.pfnDestroyParameters)(s.nrParams);
 	if (s_pfnReleaseFeature && s.nrFeature)
 		((PFN_ReleaseFeature)s_pfnReleaseFeature)(s.nrFeature);
@@ -334,7 +337,6 @@ void NeuralNR::PostPostLoad()
 	if (!s.pfnAllocateParameters)
 	{ logger::info("NeuralNR: AllocateParameters export missing"); return; }
 	
-	// PATCH: execute function logic without assigning the NVSDK_NGX_Result return struct back to the s.nrParams pointer
 	((PFN_AllocParams)s.pfnAllocateParameters)(&s.nrParams);
 	
 	if (!s.nrParams)
