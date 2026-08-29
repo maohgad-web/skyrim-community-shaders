@@ -308,6 +308,15 @@ void NeuralNR::OnPresent()
 	auto& s = GetState();
 	if (!s.initialized)
 	{
+		// LAZY INIT: Because the feature isn't registered in FeatureVersions.h yet,
+		// the engine never calls PostPostLoad(). We manually trigger it on Frame 1.
+		static bool s_setupAttempted = false;
+		if (!s_setupAttempted)
+		{
+			s_setupAttempted = true;
+			PostPostLoad();
+		}
+
 		if (!s.nrFeature && CreateFeature()) s.initialized = true;
 		if (!s.initialized) return;
 	}
