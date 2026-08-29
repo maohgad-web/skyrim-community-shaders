@@ -176,7 +176,7 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 
 	// PATCH: Restored plural "S" to TARGETS
 	auto* depthSRV = globals::game::renderer->GetDepthStencilData()
-		.depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN].depthSRV.get();
+		.depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN].depthSRV;
 	if (depthSRV)
 	{
 		ID3D11Resource* dres = nullptr;
