@@ -218,26 +218,30 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 
 	tryCreateMotionVectorTexture();
 
-	auto* depthSRV = globals::game::renderer->GetDepthStencilData()
-		.depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN].depthSRV;
-	if (depthSRV)
+	// Continuously retry fetching the depth buffer if it wasn't ready on frame 1
+	if (!s.depthSRV)
 	{
-		ID3D11Resource* dres = nullptr;
-		depthSRV->GetResource(&dres);
-		if (dres)
+		auto* depthSRV = globals::game::renderer->GetDepthStencilData()
+			.depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN].depthSRV;
+		if (depthSRV)
 		{
-			ID3D11Texture2D* dtex = nullptr;
-			if (SUCCEEDED(dres->QueryInterface(IID_PPV_ARGS(&dtex))))
+			ID3D11Resource* dres = nullptr;
+			depthSRV->GetResource(&dres);
+			if (dres)
 			{
-				D3D11_TEXTURE2D_DESC dd{}; dtex->GetDesc(&dd);
-				D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-				sd.Format = DXGI_FORMAT_R32_FLOAT;
-				sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sd.Texture2D.MipLevels = 1;
-				if (FAILED(dev->CreateShaderResourceView(dtex, &sd, &s.depthSRV)))
-					logger::warn("NeuralNR: depth SRV (R32_FLOAT override) failed");
-				dtex->Release();
+				ID3D11Texture2D* dtex = nullptr;
+				if (SUCCEEDED(dres->QueryInterface(IID_PPV_ARGS(&dtex))))
+				{
+					D3D11_TEXTURE2D_DESC dd{}; dtex->GetDesc(&dd);
+					D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+					sd.Format = DXGI_FORMAT_R32_FLOAT;
+					sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sd.Texture2D.MipLevels = 1;
+					if (SUCCEEDED(dev->CreateShaderResourceView(dtex, &sd, &s.depthSRV)))
+						logger::info("NeuralNR: Depth SRV successfully acquired!");
+					dtex->Release();
+				}
+				dres->Release();
 			}
-			dres->Release();
 		}
 	}
 
@@ -440,9 +444,6 @@ void NeuralNR::PostPostLoad()
 	featureInfo.PathListInfo.Path = searchPaths;
 	featureInfo.PathListInfo.Length = 1;
 
-	// Use valid generic AppID to bypass driver blacklists, and do NOT return if Init_Ext fails.
-	// Streamline has already initialized NGX globally; if Init_Ext throws a double-init or
-	// out-of-date conflict, we gracefully piggyback on Streamline's valid context.
 	NVSDK_NGX_Result initRes = ((PFN_InitExt)s.pfnInitExt)(
 		231313132ULL, 
 		appPath.c_str(), 
