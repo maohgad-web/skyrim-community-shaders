@@ -1,5 +1,4 @@
 #include "Features/NeuralNR.h"
-#include "Features/NeuralNR/CallerSpoof.h"
 #include "Features/Upscaling.h"
 #include "Globals.h"
 
@@ -11,12 +10,41 @@
 
 namespace
 {
-	// CALIBRATE: match the real NVSDK_NGX_D3D11.h signatures.
-	using PFN_InitExt         = HRESULT(WINAPI*)(const char*, const wchar_t*, ID3D11Device*, int*, void*);
-	using PFN_AllocParams     = NVSDK_NGX_Parameter*(WINAPI*)(NVSDK_NGX_Parameter**);
-	using PFN_CreateFeature   = NVSDK_NGX_Result(WINAPI*)(ID3D11DeviceContext*, int, NVSDK_NGX_Parameter*, NVSDK_NGX_Handle**);
-	using PFN_EvaluateFeature = NVSDK_NGX_Result(WINAPI*)(ID3D11DeviceContext*, NVSDK_NGX_Handle*, NVSDK_NGX_Parameter*, void*);
-	using PFN_DestroyParams   = void(WINAPI*)(NVSDK_NGX_Parameter**);
+	// ========================================================================
+	// NGX D3D11 ABI — CALIBRATE against the real NVSDK_NGX_D3D11.h (a
+	// prerequisite, dropped at src/Features/NVSDK_NGX_D3D11.h).
+	//
+	// Architecture (per the first-hand integration doc):
+	//   - The param block comes from the CORE's GetCapabilityParameters. A
+	//     fresh AllocateParameters block lacks the snippet/preset callbacks
+	//     the feature expects.
+	//   - The snippet's PopulateParameters_Impl fills the block with its own
+	//     private keys (resources, Width/Height, MVecScale, DepthInverted,
+	//     tuning) — but NOT the subrect keys, which we set by hand.
+	//   - The gated snippet entry points (init, populate, create, evaluate,
+	//     release) must originate from a compliant caller (a module whose
+	//     filename contains "nvngx.dll"). We resolve them from a BACKEND
+	//     module. We do NOT provide the backend (the shim) — it's the user's.
+	//     Without it, CreateFeature fails the caller check.
+	// ========================================================================
+
+	// CALIBRATE: Neural Rendering feature id (observed: 18 / 0x12).
+	constexpr int kFeatureDLSSNR = 18;
+
+	// CALIBRATE: confirm these export names + signatures against the real header.
+	using PFN_InitExt             = HRESULT(WINAPI*)(const char*, const wchar_t*, ID3D11Device*, int*, void*);
+	using PFN_GetCapabilityParams = NVSDK_NGX_Parameter*(WINAPI*)(NVSDK_NGX_Parameter**); // core export
+	using PFN_PopulateParameters  = NVSDK_NGX_Result(WINAPI*)(NVSDK_NGX_Parameter*);      // snippet, gated
+	using PFN_CreateFeature       = NVSDK_NGX_Result(WINAPI*)(ID3D11DeviceContext*, int, NVSDK_NGX_Parameter*, NVSDK_NGX_Handle**);
+	using PFN_EvaluateFeature     = NVSDK_NGX_Result(WINAPI*)(ID3D11DeviceContext*, NVSDK_NGX_Handle*, NVSDK_NGX_Parameter*, void*);
+	using PFN_ReleaseFeature      = void(WINAPI*)(NVSDK_NGX_Handle*);
+
+	// CALIBRATE: backend = the gate-compliant caller (the shim). Default is the
+	// snippet name; point this at your shim so the gated calls pass the check.
+	const wchar_t* kBackendDll     = L"nvngx_dlssnr.dll";
+	// CALIBRATE: the NGX core module (loaded in-process when DLSS is active).
+	const wchar_t* kCoreDllPrimary = L"_nvngx.dll";
+	const wchar_t* kCoreDllAlt     = L"nvngx.dll";
 }
 
 namespace CSS
@@ -33,15 +61,25 @@ namespace CSS
 	void NeuralNR::LoadDLL()
 	{
 		auto& s = GetState();
-		// CALIBRATE: confirm the deployed data-dir helper.
-		const auto path = Globals::DataDir + L"\\Shaders\\NeuralNR\\nvngx_dlssnr.dll";
-		s.hDLL = LoadLibraryW(path.c_str());
-		if (!s.hDLL) return;
-		s.pfnInitExt            = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_Init_Ext");
-		s.pfnAllocateParameters = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_AllocateParameters");
-		s.pfnCreateFeature      = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_CreateFeature");
-		s.pfnEvaluateFeature    = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
-		s.pfnDestroyParameters  = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_FreeParameters");
+
+		// 1. The backend — the gate-compliant caller (the shim). The gated
+		//    snippet entry points are resolved from here. WE DO NOT PROVIDE IT.
+		s.hBackend = LoadLibraryW(kBackendDll);
+		if (s.hBackend)
+		{
+			s.pfnInitExt            = GetProcAddress(s.hBackend, "NVSDK_NGX_D3D11_Init_Ext");
+			s.pfnPopulateParameters = GetProcAddress(s.hBackend, "NVSDK_NGX_D3D11_PopulateParameters_Impl");
+			s.pfnCreateFeature      = GetProcAddress(s.hBackend, "NVSDK_NGX_D3D11_CreateFeature");
+			s.pfnEvaluateFeature    = GetProcAddress(s.hBackend, "NVSDK_NGX_D3D11_EvaluateFeature");
+			s.pfnReleaseFeature     = GetProcAddress(s.hBackend, "NVSDK_NGX_D3D11_ReleaseFeature");
+		}
+
+		// 2. The core — owns the capability param block. Loaded in-process when
+		//    DLSS is active (a gate condition), so GetModuleHandle should succeed.
+		s.hCore = GetModuleHandleW(kCoreDllPrimary);
+		if (!s.hCore) s.hCore = GetModuleHandleW(kCoreDllAlt);
+		if (s.hCore)
+			s.pfnGetCapabilityParams = GetProcAddress(s.hCore, "NVSDK_NGX_D3D11_GetCapabilityParameters");
 	}
 
 	bool NeuralNR::CheckGate()
@@ -63,7 +101,7 @@ namespace CSS
 		if (d.VendorId != 0x10DE) return false; // NVIDIA
 		// CALIBRATE: RTX 50 (Blackwell) device-ID range.
 		if (!(d.DeviceId >= 0x2B00 && d.DeviceId <= 0x2BFF)) return false;
-		// DLSS must be active so the NGX runtime is already alive in-process.
+		// DLSS must be active so the NGX core is already alive in-process.
 		if (globals::features::upscaling.GetUpscaleMethod() != UpscaleMethod::kDLSS) return false;
 		D3D11_DRIVER_METADATA meta{};
 		if (FAILED(dev->CheckFeatureSupport(D3D11_FEATURE_DRIVER_METADATA, &meta, sizeof(meta)))) return false;
@@ -98,17 +136,18 @@ namespace CSS
 	bool NeuralNR::CreateFeature()
 	{
 		auto& s = GetState();
-		// No-op seam. Your own implementation (if any) drops in here.
-		CallerSpoof::Install();
+		if (!s.pfnCreateFeature)
+		{ logger::error("NeuralNR: backend CreateFeature export missing"); return false; }
+		// The gated create call originates from the backend (the compliant
+		// caller). No caller-spoof here — that's the backend's job.
 		NVSDK_NGX_Result res = ((PFN_CreateFeature)s.pfnCreateFeature)(
-			globals::d3d::context, NVSDK_NGX_Feature_Reserved_DLSSNR, s.nrParams, &s.nrFeature);
-		CallerSpoof::Uninstall();
+			globals::d3d::context, kFeatureDLSSNR, s.nrParams, &s.nrFeature);
 		if (!NVSDK_NGX_SUCCEED(res) || !s.nrFeature)
 		{
 			logger::error("NeuralNR: CreateFeature failed, res=0x{:X}", static_cast<uint32_t>(res));
 			return false;
 		}
-		logger::info("NeuralNR: CreateFeature Success.");
+		logger::info("NeuralNR: CreateFeature Success (feature id {}).", kFeatureDLSSNR);
 		return true;
 	}
 
@@ -207,10 +246,18 @@ namespace CSS
 	void NeuralNR::ReleaseFeature()
 	{
 		auto& s = GetState();
-		if (s.pfnDestroyParameters && s.nrParams)
-			((PFN_DestroyParams)s.pfnDestroyParameters)(&s.nrParams);
+		if (s.nrFeature)
+		{
+			// Section 3: release only at teardown, with the device idle, and
+			// before destroying the images the feature was created against.
+			globals::d3d::context->Flush();
+			if (s.pfnReleaseFeature)
+				((PFN_ReleaseFeature)s.pfnReleaseFeature)(s.nrFeature);
+			s.nrFeature = nullptr;
+		}
+		// CALIBRATE: release the capability param block if the core exposes a
+		// FreeParameters/DestroyParameters for it.
 		s.nrParams = nullptr;
-		s.nrFeature = nullptr; // CALIBRATE: call DestroyFeature if the header exposes one
 	}
 
 	void NeuralNR::DispatchProxy()
@@ -285,6 +332,9 @@ namespace CSS
 		P->Set("DLSSNR.MVec",   (ID3D11Resource*)s.mvTex);
 		P->Set("DLSSNR.Depth",  ResourceFromView(s.depthSRV));
 
+		// Subrects — no separator (section 5). PopulateParameters_Impl does not
+		// cover these; setting them by hand is what makes the cost scale with
+		// the working region (section 10).
 		auto SetSubrect = [&](const char* name) {
 			P->Set((std::string(name) + "SubrectBaseX").c_str(), 0);
 			P->Set((std::string(name) + "SubrectBaseY").c_str(), 0);
@@ -308,22 +358,36 @@ namespace CSS
 	{
 		auto& s = GetState();
 		LoadDLL();
-		if (!s.hDLL || !s.pfnCreateFeature || !s.pfnEvaluateFeature)
-		{ logger::info("NeuralNR: DLL/exports not found — disabled"); return; }
+		if (!s.hBackend || !s.pfnCreateFeature || !s.pfnEvaluateFeature || !s.pfnGetCapabilityParams)
+		{ logger::info("NeuralNR: backend/core exports not found — disabled"); return; }
 		if (!CheckGate())
 		{ logger::info("NeuralNR: gate failed — disabled"); return; }
 		if (!CompileShaders())
 		{ logger::info("NeuralNR: shader compile failed"); return; }
+
+		// 1. Init the NGX runtime (via the backend, per the doc's "init from the shim").
 		int version = 0;
 		// CALIBRATE: confirm Init_Ext signature + return type.
-		if (FAILED(((PFN_InitExt)s.pfnInitExt)("css-neuralnr", L"", globals::d3d::device, &version, nullptr)))
+		if (s.pfnInitExt &&
+		    FAILED(((PFN_InitExt)s.pfnInitExt)("css-neuralnr", L"", globals::d3d::device, &version, nullptr)))
 		{ logger::info("NeuralNR: Init_Ext failed"); return; }
-		if (!s.pfnAllocateParameters)
-		{ logger::info("NeuralNR: AllocateParameters export missing"); return; }
-		s.nrParams = ((PFN_AllocParams)s.pfnAllocateParameters)(&s.nrParams);
+
+		// 2. Get the CORE's capability param block (NOT a fresh AllocateParameters —
+		//    a fresh block lacks the snippet/preset callbacks the feature expects).
+		s.nrParams = ((PFN_GetCapabilityParams)s.pfnGetCapabilityParams)(&s.nrParams);
 		if (!s.nrParams)
-		{ logger::info("NeuralNR: AllocateParameters failed"); return; }
-		logger::info("NeuralNR: ready to create feature (NGX v{})", version);
+		{ logger::info("NeuralNR: GetCapabilityParameters failed"); return; }
+
+		// 3. Populate the block with the snippet's own private keys (via the
+		//    backend). Covers resources, Width/Height, MVecScale, DepthInverted,
+		//    tuning — but NOT the subrect keys (set by hand in OnPresent).
+		if (s.pfnPopulateParameters)
+		{
+			auto pres = ((PFN_PopulateParameters)s.pfnPopulateParameters)(s.nrParams);
+			if (!NVSDK_NGX_SUCCEED(pres))
+				logger::warn("NeuralNR: PopulateParameters res=0x{:X} (continuing)", static_cast<uint32_t>(pres));
+		}
+		logger::info("NeuralNR: param block ready (NGX v{})", version);
 	}
 
 	void NeuralNR::Reset() { GetState().needsReset = true; }
