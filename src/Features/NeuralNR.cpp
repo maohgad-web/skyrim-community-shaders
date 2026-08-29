@@ -5,6 +5,7 @@
 #include "Utils/FileSystem.h"
 
 #include <d3d11.h>
+#include <d3dcompiler.h>
 #include <dxgi1_2.h>
 #include <fstream>
 #include <sstream>
@@ -91,12 +92,13 @@ bool NeuralNR::CheckGate()
 	if (!(d.DeviceId >= 0x2B00 && d.DeviceId <= 0x2BFF)) return false;
 	// DLSS must be active so the NGX runtime is already alive in-process.
 	if (globals::features::upscaling.GetUpscaleMethod() != Upscaling::UpscaleMethod::kDLSS) return false;
-	D3D11_DRIVER_METADATA meta{};
-	if (FAILED(dev->CheckFeatureSupport(D3D11_FEATURE_DRIVER_METADATA, &meta, sizeof(meta)))) return false;
-	// CALIBRATE: verify bit layout against the value your 616 driver logs.
-	const auto major = (meta.DriverVersion >> 16) & 0xFFFF;
-	logger::info("NeuralNR: driver raw=0x{:08X} major={}", meta.DriverVersion, major);
-	return major >= 616;
+	// PATCH: D3D11_DRIVER_METADATA / D3D11_FEATURE_DRIVER_METADATA aren't real
+	// D3D11 API symbols (confirmed against Microsoft's documented D3D11_FEATURE
+	// enum — no such entry exists). A real driver-version query would need
+	// NVAPI, a dependency this project doesn't have. Dropping this is safe:
+	// NGX's own Init call already enforces its minimum driver version and
+	// fails with FAIL_OutOfDate on its own if the driver's too old.
+	return true;
 }
 
 bool NeuralNR::CompileShaders()
