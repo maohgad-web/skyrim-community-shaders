@@ -2,6 +2,7 @@
 #include "Features/NeuralNR/CallerSpoof.h"
 #include "Features/Upscaling.h"
 #include "Globals.h"
+#include "Utils/FileSystem.h"
 
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -31,7 +32,12 @@ namespace
 	// Open the header, search for "D3D11" + the operation name, and use whatever
 	// name is actually declared there in both this decltype and the matching
 	// GetProcAddress string in LoadDLL().
-	using PFN_InitExt            = decltype(&NVSDK_NGX_D3D11_Init_Ext);
+	//
+	// NOTE: NVSDK_NGX_D3D11_Init_Ext only exists in nvsdk_ngx.h under
+	// #if defined(NGX_SNIPPET_BUILD) (the NGX Core <-> Snippet signature).
+	// We build against the NGX SDK <-> Core side, so the plain
+	// NVSDK_NGX_D3D11_Init is the correct export.
+	using PFN_InitExt            = decltype(&NVSDK_NGX_D3D11_Init);
 	using PFN_AllocParams        = decltype(&NVSDK_NGX_D3D11_AllocateParameters);
 	using PFN_CreateFeature      = decltype(&NVSDK_NGX_D3D11_CreateFeature);
 	using PFN_EvaluateFeature    = decltype(&NVSDK_NGX_D3D11_EvaluateFeature);
@@ -54,11 +60,10 @@ ID3D11Resource* NeuralNR::ResourceFromView(ID3D11View* view) const
 void NeuralNR::LoadDLL()
 {
 	auto& s = GetState();
-	// CALIBRATE: confirm the deployed data-dir helper.
-	const auto path = Globals::DataDir + L"\\Shaders\\NeuralNR\\nvngx_dlssnr.dll";
+	const auto path = Util::PathHelpers::GetFeatureShaderPath("NeuralNR") / L"nvngx_dlssnr.dll";
 	s.hDLL = LoadLibraryW(path.c_str());
 	if (!s.hDLL) return;
-	s.pfnInitExt            = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_Init_Ext");
+	s.pfnInitExt            = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_Init");
 	s.pfnAllocateParameters = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_AllocateParameters");
 	s.pfnCreateFeature      = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_CreateFeature");
 	s.pfnEvaluateFeature    = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
@@ -85,7 +90,7 @@ bool NeuralNR::CheckGate()
 	// CALIBRATE: RTX 50 (Blackwell) device-ID range.
 	if (!(d.DeviceId >= 0x2B00 && d.DeviceId <= 0x2BFF)) return false;
 	// DLSS must be active so the NGX runtime is already alive in-process.
-	if (globals::features::upscaling.GetUpscaleMethod() != UpscaleMethod::kDLSS) return false;
+	if (globals::features::upscaling.GetUpscaleMethod() != Upscaling::UpscaleMethod::kDLSS) return false;
 	D3D11_DRIVER_METADATA meta{};
 	if (FAILED(dev->CheckFeatureSupport(D3D11_FEATURE_DRIVER_METADATA, &meta, sizeof(meta)))) return false;
 	// CALIBRATE: verify bit layout against the value your 616 driver logs.
@@ -97,9 +102,9 @@ bool NeuralNR::CheckGate()
 bool NeuralNR::CompileShaders()
 {
 	auto& s = GetState();
-	auto dir = Globals::DataDir + L"\\Shaders\\";
+	auto dir = Util::PathHelpers::GetShadersPath();
 	auto compile = [&](const std::wstring& file, const char* entry, ID3D11ComputeShader** out) {
-		std::ifstream f(dir + file, std::ios::binary);
+		std::ifstream f(dir / file, std::ios::binary);
 		if (!f) { logger::warn("NeuralNR: missing shader {}", file); return false; }
 		std::stringstream ss; ss << f.rdbuf();
 		auto src = ss.str();
@@ -358,7 +363,7 @@ void NeuralNR::PostPostLoad()
 	if (!CompileShaders())
 	{ logger::info("NeuralNR: shader compile failed"); return; }
 	
-	if (!NVSDK_NGX_SUCCEED(((PFN_InitExt)s.pfnInitExt)(0x1337ULL, L"", globals::d3d::device, nullptr, nullptr)))
+	if (!NVSDK_NGX_SUCCEED(((PFN_InitExt)s.pfnInitExt)(0x1337ULL, L"", globals::d3d::device, nullptr, NVSDK_NGX_Version_API)))
 	{ logger::info("NeuralNR: Init_Ext failed"); return; }
 	
 	if (!s.pfnAllocateParameters)
