@@ -451,8 +451,8 @@ void NeuralNR::PostPostLoad()
 	const wchar_t* searchPaths[] = { dllSearchPath.c_str() };
 	
 	NVSDK_NGX_FeatureCommonInfo featureInfo{};
-	featureInfo.PathListInfo = searchPaths;
-	featureInfo.PathListInfoCount = 1;
+	featureInfo.PathListInfo.Path = searchPaths;
+	featureInfo.PathListInfo.Length = 1;
 
 	NVSDK_NGX_Result initRes = ((PFN_InitExt)s.pfnInitExt)(
 		0x1337ULL, 
