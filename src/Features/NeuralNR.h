@@ -1,25 +1,16 @@
 #pragma once
-#include "Feature.h"
 
-// PATCH: "NVSDK_NGX_D3D11.h" never existed as a real NVIDIA-shipped file — NVIDIA
-// splits D3D11 support across these three real headers instead, gated behind
-// <d3d11.h> having already been included (nvsdk_ngx.h checks for __d3d11_h__).
-// Pull these three from your extern/Streamline-DX12 submodule's ngx-sdk/include
-// folder and drop them here as Features/ngx/*.h.
 #include <d3d11.h>
 #include "ngx/nvsdk_ngx.h"
 #include "ngx/nvsdk_ngx_helpers.h"
 #include "ngx/nvsdk_ngx_params.h"
 
+#include "Feature.h"
 #include <atomic>
 #include <string>
 
-// NOTE: intentionally NOT wrapped in namespace CSS — every other feature type is
-// global-scope so that Globals.h's forward decls and Globals.cpp's definitions
-// match. (CSS::CallerSpoof in Features/NeuralNR/ stays namespaced.)
 struct NeuralNR : public Feature
 {
-	// Pure virtuals — both return std::string, no const (matches Feature base).
 	std::string GetName() override       { return "Neural NR"; }
 	std::string GetShortName() override  { return "NeuralNR"; }
 
@@ -29,8 +20,9 @@ struct NeuralNR : public Feature
 	void SaveSettings(json& o_json) override;
 	void Reset() override;
 
-	static void OnPresent();
-	static bool IsEnabled() { return GetState().initialized; }
+	// Non-static: allows access to settings and private member methods
+	void OnPresent();
+	bool IsEnabled() { return GetState().initialized; }
 
 private:
 	struct Settings

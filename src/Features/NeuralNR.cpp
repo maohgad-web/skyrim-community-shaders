@@ -13,59 +13,24 @@
 
 namespace
 {
-	// PATCH: the feature isn't in NVIDIA's real NVSDK_NGX_Feature enum (it's
-	// unreleased/reserved), so there's no NVSDK_NGX_Feature_Reserved_DLSSNR to
-	// reference — that name never existed in a real header either. Confirmed
-	// value: the programming guide states it directly ("Create with feature id
-	// 18") and independently via disassembly (mov edx, 0x12 = 18 before the
-	// CreateFeature call).
 	constexpr int kFeatureDLSSNR = 18;
 
-	// PATCH: these five now come from the real vendor headers (Features/ngx/*.h)
-	// via decltype, instead of hand-typed guesses. This pulls whatever signature
-	// NVIDIA actually declared, so a mismatch becomes a compile error instead of
-	// silent stack corruption at runtime (the guide's own warning on this).
-	//
-	// IMPORTANT: if any of these five lines fail to compile, that's diagnostic,
-	// not a dead end — it means the real header declares that export under a
-	// different name than the string LoadDLL() looks up below (e.g. NVIDIA
-	// sometimes ships a "_C" suffixed callback variant alongside the plain one).
-	// Open the header, search for "D3D11" + the operation name, and use whatever
-	// name is actually declared there in both this decltype and the matching
-	// GetProcAddress string in LoadDLL().
-	//
-	// NOTE: NVSDK_NGX_D3D11_Init_Ext only exists in nvsdk_ngx.h under
-	// #if defined(NGX_SNIPPET_BUILD) (the NGX Core <-> Snippet signature).
-	// We build against the NGX SDK <-> Core side, so the plain
-	// NVSDK_NGX_D3D11_Init is the correct export.
 	using PFN_InitExt            = decltype(&NVSDK_NGX_D3D11_Init);
 	using PFN_AllocParams        = decltype(&NVSDK_NGX_D3D11_AllocateParameters);
 	using PFN_CreateFeature      = decltype(&NVSDK_NGX_D3D11_CreateFeature);
 	using PFN_EvaluateFeature    = decltype(&NVSDK_NGX_D3D11_EvaluateFeature);
-	// PATCH: split into two — NVSDK_NGX_D3D11_ReleaseFeature takes an
-	// NVSDK_NGX_Handle* (confirmed by the compiler's own error: it releases
-	// the FEATURE, paired with CreateFeature), not a Parameter** at all.
-	// The actual parameter-block destructor is a different, separate export.
-	// "DestroyParameters" is the best-guess real name here (paired with
-	// AllocateParameters) — if this specific line fails to compile, that's
-	// the signal the real header uses a different name; check the header
-	// directly for whatever it actually calls the parameter-teardown export.
 	using PFN_ReleaseFeature     = decltype(&NVSDK_NGX_D3D11_ReleaseFeature);
 	using PFN_DestroyParams      = decltype(&NVSDK_NGX_D3D11_DestroyParameters);
 
-	void* s_pfnReleaseFeature = nullptr; // resolved in LoadDLL, used in ReleaseFeature()
+	void* s_pfnReleaseFeature = nullptr; 
 }
 
-// NOTE: intentionally NOT wrapped in namespace CSS — NeuralNR is a global-scope
-// type (see NeuralNR.h / Globals.h forward decl), matching every other feature.
-// The body below keeps its original one-tab indentation from when it was wrapped;
-// it is NOT inside a namespace. CallerSpoof stays CSS:: and is qualified below.
 ID3D11Resource* NeuralNR::ResourceFromView(ID3D11View* view) const
 {
 	if (!view) return nullptr;
 	ID3D11Resource* res = nullptr;
 	view->GetResource(&res);
-	if (res) res->Release(); // NGX holds its own lifetime; drop the +1
+	if (res) res->Release(); 
 	return res;
 }
 
@@ -79,8 +44,6 @@ void NeuralNR::LoadDLL()
 	s.pfnAllocateParameters = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_AllocateParameters");
 	s.pfnCreateFeature      = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_CreateFeature");
 	s.pfnEvaluateFeature    = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
-	// PATCH: these are two separate exports now (see the PFN typedefs above) —
-	// one tears down the parameter block, the other releases the feature handle.
 	s.pfnDestroyParameters  = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_DestroyParameters");
 	s_pfnReleaseFeature     = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_ReleaseFeature");
 }
@@ -101,17 +64,9 @@ bool NeuralNR::CheckGate()
 	DXGI_ADAPTER_DESC1 d{};
 	adp1->GetDesc1(&d);
 	adp1->Release();
-	if (d.VendorId != 0x10DE) return false; // NVIDIA
-	// CALIBRATE: RTX 50 (Blackwell) device-ID range.
+	if (d.VendorId != 0x10DE) return false;
 	if (!(d.DeviceId >= 0x2B00 && d.DeviceId <= 0x2BFF)) return false;
-	// DLSS must be active so the NGX runtime is already alive in-process.
 	if (globals::features::upscaling.GetUpscaleMethod() != Upscaling::UpscaleMethod::kDLSS) return false;
-	// PATCH: D3D11_DRIVER_METADATA / D3D11_FEATURE_DRIVER_METADATA aren't real
-	// D3D11 API symbols (confirmed against Microsoft's documented D3D11_FEATURE
-	// enum — no such entry exists). A real driver-version query would need
-	// NVAPI, a dependency this project doesn't have. Dropping this is safe:
-	// NGX's own Init call already enforces its minimum driver version and
-	// fails with FAIL_OutOfDate on its own if the driver's too old.
 	return true;
 }
 
@@ -125,8 +80,9 @@ bool NeuralNR::CompileShaders()
 		std::stringstream ss; ss << f.rdbuf();
 		auto src = ss.str();
 		ID3DBlob* blob = nullptr;
+		// PATCH: Fixed macro syntax for default standard file includes
 		if (FAILED(D3DCompile(src.c_str(), src.size(), file.c_str(), nullptr,
-			D3D_COMPILE_STANDARD_DEBUG_INCLUDES, entry, "cs_6_0", 0, 0, &blob, nullptr)))
+			D3D_COMPILE_STANDARD_FILE_INCLUDE, entry, "cs_6_0", 0, 0, &blob, nullptr)))
 		{ logger::warn("NeuralNR: D3DCompile failed for {}", file); return false; }
 		auto hr = globals::d3d::device->CreateComputeShader(
 			blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, out);
@@ -140,7 +96,6 @@ bool NeuralNR::CompileShaders()
 bool NeuralNR::CreateFeature()
 {
 	auto& s = GetState();
-	// No-op seam. Your own implementation (if any) drops in here.
 	CSS::CallerSpoof::Install();
 	NVSDK_NGX_Result res = ((PFN_CreateFeature)s.pfnCreateFeature)(
 		globals::d3d::context, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), s.nrParams, &s.nrFeature);
@@ -180,22 +135,13 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 		return SUCCEEDED(dev->CreateUnorderedAccessView(t, &ud, out));
 	};
 
-	// Motion vectors come from Upscaling and may not exist yet the first time
-	// this runs (e.g. an early menu frame before Upscaling has produced
-	// motionVectorCopyTexture). Factored out so it can be retried on later
-	// frames without redoing the rest of resource creation.
 	auto tryCreateMotionVectorTexture = [&]() {
-		if (s.mvTex) return; // already have it
+		if (s.mvTex) return; 
 		if (auto* mv = globals::features::upscaling.motionVectorCopyTexture.get())
 		{
 			auto* raw = static_cast<ID3D11Texture2D*>(mv->resource.get());
 			if (raw)
 			{
-				// PATCH: DXGI_FORMAT_R8G8_FLOAT isn't a real DXGI_FORMAT value
-				// (no 8-bit-per-channel float format exists). Using a real,
-				// standard motion-vector format instead — ideally this should
-				// match whatever format Upscaling's own motionVectorCopyTexture
-				// actually uses, worth double-checking.
 				mkTex(&s.mvTex, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_SHADER_RESOURCE);
 				mkSRV(s.mvTex, DXGI_FORMAT_R16G16_FLOAT, &s.mvSRV);
 			}
@@ -204,8 +150,6 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 
 	if (!sizeChanged)
 	{
-		// Resolution unchanged — everything else already exists. Still retry
-		// the motion vector texture if it wasn't available on first creation.
 		tryCreateMotionVectorTexture();
 		return;
 	}
@@ -224,17 +168,11 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 	mkTex(&s.transferOut, hdrFmt, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
 	mkUAV(s.transferOut, hdrFmt, &s.transferOutUAV);
 
-	// MVs — retry logic above; this is the first attempt.
 	tryCreateMotionVectorTexture();
 
-	// PATCH: the real member is `depthSRV`, confirmed against CommonLibSSE-NG's
-	// own generated docs (ng.commonlib.dev / po3.commonlib.dev both list it) —
-	// `.textureView` never existed. We still derive our own separately-
-	// formatted SRV from its underlying resource below, since depth textures
-	// are commonly created TYPELESS internally and need an explicit format
-	// override to be sampled as a normal SRV.
+	// PATCH: Fixed RE::RENDER_TARGET_DEPTHSTENCIL spelling for CommonLibSSE wrapper enum
 	auto* depthSRV = globals::game::renderer->GetDepthStencilData()
-		.depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN].depthSRV.get();
+		.depthStencils[RE::RENDER_TARGET_DEPTHSTENCIL::kMAIN].depthSRV.get();
 	if (depthSRV)
 	{
 		ID3D11Resource* dres = nullptr;
@@ -247,7 +185,7 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 				D3D11_TEXTURE2D_DESC dd{}; dtex->GetDesc(&dd);
 				logger::info("NeuralNR: Skyrim Depth Format: 0x{:X}", static_cast<uint32_t>(dd.Format));
 				D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-				sd.Format = DXGI_FORMAT_R32_FLOAT; // CALIBRATE: override for typeless depth
+				sd.Format = DXGI_FORMAT_R32_FLOAT; 
 				sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sd.Texture2D.MipLevels = 1;
 				if (FAILED(dev->CreateShaderResourceView(dtex, &sd, &s.depthSRV)))
 					logger::warn("NeuralNR: depth SRV (R32_FLOAT override) failed");
@@ -279,10 +217,8 @@ void NeuralNR::ReleaseFeature()
 {
 	auto& s = GetState();
 	if (s.pfnDestroyParameters && s.nrParams)
-		((PFN_DestroyParams)s.pfnDestroyParameters)(&s.nrParams);
-	// PATCH: this is the actual feature-handle release (was previously
-	// miswired to the parameter-destroy call above, which doesn't match its
-	// real signature — see the PFN typedefs).
+		// PATCH: Send the parameter block pointer itself, not its memory address
+		((PFN_DestroyParams)s.pfnDestroyParameters)(s.nrParams);
 	if (s_pfnReleaseFeature && s.nrFeature)
 		((PFN_ReleaseFeature)s_pfnReleaseFeature)(s.nrFeature);
 	s.nrParams = nullptr;
@@ -331,9 +267,7 @@ void NeuralNR::OnPresent()
 	const uint32_t w = dsc.Width, h = dsc.Height;
 	if (s.w != w || s.h != h) s.needsReset = true;
 	CreateResources(w, h, dsc.Format);
-	// Bail out this frame (and retry next frame via CreateResources) rather
-	// than handing NGX a null MVec resource, which is one of the four
-	// resources this feature requires unconditionally.
+	
 	if (!s.inputColor || !s.nrOutputTex || !s.mvTex || !s.depthSRV) { back->Release(); return; }
 	const bool hdr = (dsc.Format == DXGI_FORMAT_R10G10B10A2_UNORM)
 		|| (dsc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
@@ -399,7 +333,10 @@ void NeuralNR::PostPostLoad()
 	
 	if (!s.pfnAllocateParameters)
 	{ logger::info("NeuralNR: AllocateParameters export missing"); return; }
-	s.nrParams = ((PFN_AllocParams)s.pfnAllocateParameters)(&s.nrParams);
+	
+	// PATCH: execute function logic without assigning the NVSDK_NGX_Result return struct back to the s.nrParams pointer
+	((PFN_AllocParams)s.pfnAllocateParameters)(&s.nrParams);
+	
 	if (!s.nrParams)
 	{ logger::info("NeuralNR: AllocateParameters failed"); return; }
 	logger::info("NeuralNR: ready to create feature");
