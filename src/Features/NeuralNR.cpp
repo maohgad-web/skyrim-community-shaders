@@ -10,6 +10,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <filesystem>
 
 namespace
 {
@@ -37,9 +38,21 @@ ID3D11Resource* NeuralNR::ResourceFromView(ID3D11View* view) const
 void NeuralNR::LoadDLL()
 {
 	auto& s = GetState();
-	const auto path = Util::PathHelpers::GetFeatureShaderPath("NeuralNR") / L"nvngx_dlssnr.dll";
+	
+	// Check feature folder first, fallback to Streamline folder if missing
+	auto path = Util::PathHelpers::GetFeatureShaderPath("NeuralNR") / L"nvngx_dlssnr.dll";
+	if (!std::filesystem::exists(path)) 
+	{
+		path = Util::PathHelpers::GetShadersPath() / L"Upscaling" / L"Streamline" / L"nvngx_dlssnr.dll";
+	}
+
 	s.hDLL = LoadLibraryW(path.c_str());
-	if (!s.hDLL) return;
+	if (!s.hDLL) 
+	{
+		logger::warn("NeuralNR: Could not find nvngx_dlssnr.dll at {}", path.string());
+		return;
+	}
+
 	s.pfnInitExt            = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_Init");
 	s.pfnAllocateParameters = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_AllocateParameters");
 	s.pfnCreateFeature      = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_CreateFeature");
@@ -75,7 +88,6 @@ bool NeuralNR::CompileShaders()
 	auto& s = GetState();
 	auto dir = Util::PathHelpers::GetShadersPath();
 	
-	// PATCH: Changed input parameters to narrow strings (const char*)
 	auto compile = [&](const char* file, const char* entry, ID3D11ComputeShader** out) {
 		std::ifstream f(dir / file, std::ios::binary);
 		if (!f) { logger::warn("NeuralNR: missing shader {}", file); return false; }
@@ -91,7 +103,6 @@ bool NeuralNR::CompileShaders()
 		return SUCCEEDED(hr) && *out;
 	};
 	
-	// PATCH: Passed standard narrow strings for proper compiling
 	return compile("NeuralNR_SDRProxy.hlsl", "CS_GenerateSDRProxy", &s.proxyCS)
 		&& compile("NeuralNR_Transfer.hlsl", "CS_TransferEditToHDR", &s.transferCS);
 }
@@ -99,10 +110,15 @@ bool NeuralNR::CompileShaders()
 bool NeuralNR::CreateFeature()
 {
 	auto& s = GetState();
+	
+	// PATCH: Safety guard to prevent null pointer dereference crash
+	if (!s.pfnCreateFeature || !s.nrParams) return false;
+
 	CSS::CallerSpoof::Install();
 	NVSDK_NGX_Result res = ((PFN_CreateFeature)s.pfnCreateFeature)(
 		globals::d3d::context, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), s.nrParams, &s.nrFeature);
 	CSS::CallerSpoof::Uninstall();
+	
 	if (!NVSDK_NGX_SUCCEED(res) || !s.nrFeature)
 	{
 		logger::error("NeuralNR: CreateFeature failed, res=0x{:X}", static_cast<uint32_t>(res));
@@ -140,10 +156,9 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 
 	auto tryCreateMotionVectorTexture = [&]() {
 		if (s.mvTex) return; 
-		// PATCH: Removed invalid .get() call since motionVectorCopyTexture is a raw Texture2D pointer
 		if (auto* mv = globals::features::upscaling.motionVectorCopyTexture)
 		{
-			auto* raw = static_cast<ID3D11Texture2D*>(mv->resource.get());
+			auto* raw = static_cast<ID3D11Texture2D*>(mv->resource);
 			if (raw)
 			{
 				mkTex(&s.mvTex, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_SHADER_RESOURCE);
@@ -174,7 +189,6 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 
 	tryCreateMotionVectorTexture();
 
-	// PATCH: Restored plural "S" to TARGETS
 	auto* depthSRV = globals::game::renderer->GetDepthStencilData()
 		.depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN].depthSRV;
 	if (depthSRV)
@@ -262,6 +276,9 @@ void NeuralNR::OnPresent()
 		if (!s.nrFeature && CreateFeature()) s.initialized = true;
 		if (!s.initialized) return;
 	}
+
+	// PATCH: Final safety guard to guarantee no null exceptions during rendering loop
+	if (!s.nrFeature || !s.nrParams || !s.pfnEvaluateFeature) return;
 
 	auto ctx = globals::d3d::context;
 	ID3D11Texture2D* back = nullptr;
