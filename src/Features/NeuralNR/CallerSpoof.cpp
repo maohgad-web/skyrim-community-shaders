@@ -1,5 +1,4 @@
 #include "Features/NeuralNR/CallerSpoof.h"
-#include "Logger.h"
 #include "stl/detour.h"
 #include <windows.h>
 #include <intrin.h>
