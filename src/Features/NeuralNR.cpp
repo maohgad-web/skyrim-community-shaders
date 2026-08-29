@@ -27,6 +27,13 @@ namespace
 
 	void* s_pfnReleaseFeature = nullptr;
 
+	// PATCH: checks the swap chain's actual negotiated output color space
+	// (real HDR10/PQ signal) instead of the backbuffer's pixel format. A
+	// float/10-bit backbuffer format is commonly used for internal rendering
+	// precision (bloom, tonemapping headroom) whether or not HDR output is
+	// actually active — checking the format alone was a false positive on a
+	// setup with HDR genuinely off everywhere (INI, NVIDIA App, Windows).
+	// Fails safe: returns false (SDR path) if any query along the way fails.
 	bool IsActuallyHDROutput(IDXGISwapChain* swapChain)
 	{
 		bool isHDR = false;
@@ -182,8 +189,16 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 		return SUCCEEDED(dev->CreateUnorderedAccessView(t, &ud, out));
 	};
 
+	// PATCH: previously created a brand-new, separately allocated s.mvTex
+	// and never copied real motion vector data into it — NGX was being
+	// handed zeroed/garbage GPU memory every frame regardless of whether
+	// EvaluateFeature succeeded. Fixed by building a view directly onto
+	// Upscaling's own live motion-vector resource instead: it's refreshed
+	// every frame by Upscaling's own pipeline (the "copy" in its name),
+	// so a view onto it stays current with no copy step of our own —
+	// and using its real queried format instead of a guessed one.
 	auto tryCreateMotionVectorTexture = [&]() {
-		if (s.mvSRV) return; 
+		if (s.mvSRV) return; // already have a view
 		if (auto* mv = globals::features::upscaling.motionVectorCopyTexture)
 		{
 			auto* raw = static_cast<ID3D11Texture2D*>(mv->resource.get());
@@ -303,6 +318,8 @@ void NeuralNR::OnPresent()
 	auto& s = GetState();
 	if (!s.initialized)
 	{
+		// LAZY INIT: Because the feature isn't registered in FeatureVersions.h yet,
+		// the engine never calls PostPostLoad(). We manually trigger it on Frame 1.
 		static bool s_setupAttempted = false;
 		if (!s_setupAttempted)
 		{
@@ -326,6 +343,11 @@ void NeuralNR::OnPresent()
 
 	if (!s.inputColor || !s.nrOutputTex || !s.mvSRV || !s.depthSRV) { back->Release(); return; }
 
+	// PATCH: real HDR10/PQ output check (see IsActuallyHDROutput above),
+	// replacing the hardcoded `false` — checks the swap chain's negotiated
+	// color space instead of its storage format, so it correctly reads SDR
+	// when HDR is genuinely off everywhere, while still flipping true for a
+	// setup where HDR output is actually active.
 	const bool hdr = IsActuallyHDROutput(globals::d3d::swapChain);
 
 	ctx->CopyResource(s.inputColor, back);
@@ -374,9 +396,16 @@ void NeuralNR::OnPresent()
 	}
 	else if (!NVSDK_NGX_SUCCEED(evalRes))
 	{
+		// PATCH: throttled failure logging — was previously unconditional
+		// every frame, which floods the log at 60+ fps during exactly the
+		// debugging session where you need it readable. Now logs
+		// immediately on the first failure, immediately again if the
+		// result code changes (a different problem than before), and
+		// otherwise re-logs periodically as a "still failing" heartbeat
+		// instead of every single frame.
 		static NVSDK_NGX_Result s_lastLoggedFailure = static_cast<NVSDK_NGX_Result>(-1);
 		static uint32_t s_failureLogFrameCounter = 0;
-		constexpr uint32_t kFailureLogIntervalFrames = 300; 
+		constexpr uint32_t kFailureLogIntervalFrames = 300; // ~5s at 60fps
 
 		const bool isNewFailureCode = (evalRes != s_lastLoggedFailure);
 		++s_failureLogFrameCounter;
