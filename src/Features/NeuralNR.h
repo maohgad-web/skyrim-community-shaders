@@ -27,6 +27,7 @@ struct NeuralNR : public Feature
 private:
 	struct Settings
 	{
+		bool  enabled = true;
 		float intensity = 1.0f, style = 0.0f;
 		float localTone = 0.5f, localStructure = 0.5f, skinStructure = 0.5f;
 		int   useAutoMask = 1, depthInverted = 0, preset = 0;

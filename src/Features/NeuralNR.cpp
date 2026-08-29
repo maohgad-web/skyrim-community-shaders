@@ -451,7 +451,7 @@ void NeuralNR::LoadSettings(json& o_json)
 	if (o_json.contains("NeuralNR") && !o_json["NeuralNR"].is_null())
 	{
 		auto& j = o_json["NeuralNR"];
-		settings.enabled = j.value("enabled", false);
+		settings.enabled = j.value("enabled", true);
 		settings.intensity = j.value("intensity", 1.0f);
 		settings.localTone = j.value("localTone", 0.5f);
 		settings.localStructure = j.value("localStructure", 0.5f);
