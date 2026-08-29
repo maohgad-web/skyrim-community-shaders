@@ -1,6 +1,16 @@
 #pragma once
 #include "Feature.h"
-#include "NVSDK_NGX_D3D11.h"
+
+// PATCH: "NVSDK_NGX_D3D11.h" never existed as a real NVIDIA-shipped file — NVIDIA
+// splits D3D11 support across these three real headers instead, gated behind
+// <d3d11.h> having already been included (nvsdk_ngx.h checks for __d3d11_h__).
+// Pull these three from your extern/Streamline-DX12 submodule's ngx-sdk/include
+// folder and drop them here as Features/ngx/*.h.
+#include <d3d11.h>
+#include "ngx/nvsdk_ngx.h"
+#include "ngx/nvsdk_ngx_helpers.h"
+#include "ngx/nvsdk_ngx_params.h"
+
 #include <atomic>
 #include <string>
 
@@ -35,20 +45,14 @@ namespace CSS
 		{
 			bool initialized = false;
 			std::atomic<bool> needsReset{true};
-			// The gate-compliant caller (the shim) — user-provided. The gated
-			// snippet entry points are resolved from here. WE DO NOT PROVIDE IT.
-			HMODULE hBackend = nullptr;
-			// The NGX core (_nvngx.dll / nvngx.dll) — owns the capability param block.
-			HMODULE hCore = nullptr;
+			HMODULE hDLL = nullptr;
 			NVSDK_NGX_Handle* nrFeature = nullptr;
-			// The core's capability param block (NOT a fresh AllocateParameters).
 			NVSDK_NGX_Parameter* nrParams = nullptr;
 			void* pfnInitExt = nullptr;
-			void* pfnGetCapabilityParams = nullptr;   // core export
-			void* pfnPopulateParameters = nullptr;    // snippet, gated (via backend)
-			void* pfnCreateFeature = nullptr;         // snippet, gated (via backend)
-			void* pfnEvaluateFeature = nullptr;       // snippet, gated (via backend)
-			void* pfnReleaseFeature = nullptr;        // snippet, gated (via backend)
+			void* pfnAllocateParameters = nullptr;
+			void* pfnCreateFeature = nullptr;
+			void* pfnEvaluateFeature = nullptr;
+			void* pfnDestroyParameters = nullptr;
 
 			ID3D11Texture2D* inputColor = nullptr;
 			ID3D11Texture2D* sdrProxyTex = nullptr;
