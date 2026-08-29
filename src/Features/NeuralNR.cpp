@@ -60,7 +60,7 @@ void NeuralNR::LoadDLL()
 {
 	auto& s = GetState();
 
-	// Load the core NVIDIA NGX SDK to get the function exports
+	// Load the core NVIDIA NGX SDK to obtain function exports
 	s.hDLL = LoadLibraryW(L"nvngx.dll");
 	if (!s.hDLL) s.hDLL = LoadLibraryW(L"_nvngx.dll");
 
@@ -427,17 +427,18 @@ void NeuralNR::PostPostLoad()
 	if (!CompileShaders())
 	{ logger::info("NeuralNR: shader compile failed"); return; }
 
-	std::wstring appPath = Util::PathHelpers::GetFeatureShaderPath("NeuralNR").wstring();
-	std::wstring dllSearchPath = appPath;
+	// Ensure string buffers and pointers persist in memory across the NGX lifecycle
+	static std::wstring appPath = Util::PathHelpers::GetFeatureShaderPath("NeuralNR").wstring();
+	static std::wstring dllSearchPath = appPath;
 
 	if (!std::filesystem::exists(Util::PathHelpers::GetFeatureShaderPath("NeuralNR") / L"nvngx_dlssnr.dll"))
 	{
 		dllSearchPath = (Util::PathHelpers::GetShadersPath() / L"Upscaling" / L"Streamline").wstring();
 	}
 
-	const wchar_t* searchPaths[] = { dllSearchPath.c_str() };
+	static const wchar_t* searchPaths[] = { dllSearchPath.c_str() };
 	
-	NVSDK_NGX_FeatureCommonInfo featureInfo{};
+	static NVSDK_NGX_FeatureCommonInfo featureInfo{};
 	featureInfo.PathListInfo.Path = searchPaths;
 	featureInfo.PathListInfo.Length = 1;
 

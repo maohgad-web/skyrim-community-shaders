@@ -1,6 +1,7 @@
 #include "Features/NeuralNR/CallerSpoof.h"
 #include <windows.h>
 #include <intrin.h>
+#include <detours.h>
 
 #pragma intrinsic(_ReturnAddress)
 
@@ -41,7 +42,11 @@ namespace CSS::CallerSpoof
 	static bool ShouldSpoof(HMODULE hModule, LPWSTR lpFilename, DWORD nSize, void* returnAddress)
 	{
 		if (!lpFilename || nSize == 0) return false;
-		if (hModule != nullptr && hModule != s_ourModule) return false;
+		
+		// CRITICAL: Only spoof queries targeting our specific Community Shaders module.
+		// Never spoof NULL queries, as NGX relies on NULL to discover the host game directory.
+		if (hModule != s_ourModule) return false;
+		
 		return CallerIsNGX(returnAddress);
 	}
 
