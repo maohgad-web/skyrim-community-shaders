@@ -22,7 +22,7 @@ struct NeuralNR : public Feature
 
 	// Non-static: allows access to settings and private member methods
 	void OnPresent();
-	bool IsEnabled() { return GetState().initialized; }
+	bool IsEnabled() override { return settings.enabled; }
 
 private:
 	struct Settings
