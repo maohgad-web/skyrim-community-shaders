@@ -387,19 +387,25 @@ void NeuralNR::OnPresent()
 
 	auto& s = GetState();
 
-	// Acquire core modules immediately
-	if (!s.pfnEvaluateFeature)
-	{
-		static bool attemptedLoad = false;
-		if (!attemptedLoad) {
-			attemptedLoad = true;
-			PostPostLoad();
-		}
-	}
-
+	// 1. Asynchronous Module Acquisition Loop
+	// Streamline injects core NGX modules dynamically, so we must poll until they appear.
 	if (!s.pfnEvaluateFeature || !s.nrParams) 
 	{
-		return;
+		static uint32_t s_modulePollCounter = 0;
+		static uint32_t s_moduleLoadAttempts = 0;
+		constexpr uint32_t kModulePollInterval = 120;
+		constexpr uint32_t kMaxModulePollAttempts = 300;
+
+		const bool firstAttempt = (s_moduleLoadAttempts == 0);
+		const bool dueForRetry  = (++s_modulePollCounter >= kModulePollInterval) && (s_moduleLoadAttempts < kMaxModulePollAttempts);
+		
+		if (firstAttempt || dueForRetry)
+		{
+			s_modulePollCounter = 0;
+			++s_moduleLoadAttempts;
+			PostPostLoad();
+		}
+		return; 
 	}
 
 	auto ctx = globals::d3d::context;
@@ -445,8 +451,8 @@ void NeuralNR::OnPresent()
 		static uint32_t s_cooldownFrames = 0;
 		static int s_strategy = 1;
 		static bool s_snippetInitialized = false;
+		static bool s_capabilitiesChecked = false;
 
-		// If cooldown is active, decrement and abort the frame
 		if (s_cooldownFrames > 0)
 		{
 			s_cooldownFrames--;
@@ -456,15 +462,34 @@ void NeuralNR::OnPresent()
 
 		if (s_createRetry++ % 60 == 0) 
 		{
-			// Safe Infinite Retries: Enforces a 600-frame cooldown without integer underflow
 			if (s_strategy > 4) {
 				logger::error("NeuralNR: Matrix exhausted. Restarting handshake loop in 10 seconds...");
 				s_strategy = 1; 
 				s_snippetInitialized = false;
+				s_capabilitiesChecked = false; 
 				s_cooldownFrames = 600; 
 				s_createRetry = 0;
 				back->Release();
 				return;
+			}
+
+			if (!s_capabilitiesChecked)
+			{
+				logger::info("NeuralNR: Pre-validating hardware capabilities for Feature DLSSNR (18)...");
+				int featureAvailable = 0;
+				NVSDK_NGX_Result availRes = P->Get("SuperSampling.Available", &featureAvailable);
+				
+				if (NVSDK_NGX_SUCCEED(availRes) && featureAvailable == 1) {
+					logger::info("NeuralNR: SuperSampling is natively supported by silicon.");
+					s_capabilitiesChecked = true;
+				} else {
+					logger::warn("NeuralNR: SuperSampling capability check failed. Injecting overrides...");
+					P->Set("DLSSNR.Available", 1);
+					P->Set("SuperSampling.Available", 1);
+					P->Set("NVSDK_NGX_Parameter_DevOverride", 1);
+					P->Set("NVSDK_NGX_Parameter_FeatureInitFlags", 1);
+					s_capabilitiesChecked = true;
+				}
 			}
 
 			if (!s_snippetInitialized) 
@@ -491,10 +516,6 @@ void NeuralNR::OnPresent()
 
 				if (s_strategy == 1 && pfnInitExt) {
 					logger::info("NeuralNR: Strategy 1 -> Snippet ABI + Capability Injection");
-					s.nrParams->Set("DLSSNR.Available", 1);
-					s.nrParams->Set("SuperSampling.Available", 1);
-					s.nrParams->Set("NVSDK_NGX_Parameter_DevOverride", 1);
-					
 					snippetInitRes = CallSnippetInit_Strategy1_SEH(
 						reinterpret_cast<FARPROC>(pfnInitExt), 231313132ULL, appPath.c_str(),
 						globals::d3d::device, NVSDK_NGX_Version_API, s.nrParams, &faulted);
