@@ -355,12 +355,21 @@ void NeuralNR::OnPresent()
 
 	if (!s.initialized)
 	{
-		if (!s.nrFeature && CreateFeature()) {
-			s.initialized = true;
-		} else {
-			logger::error("NeuralNR: Feature creation permanently failed. Disabling to prevent log spam.");
+		static uint32_t s_createRetry = 0;
+		if (s_createRetry++ % 60 == 0) // Attempt CreateFeature only once per second
+		{
+			if (!s.nrFeature && CreateFeature()) {
+				s.initialized = true;
+			} else {
+				logger::warn("NeuralNR: CreateFeature not ready yet. Retrying...");
+				back->Release();
+				return; // Safely abort frame, but allow future retries
+			}
+		}
+		else
+		{
 			back->Release();
-			return;
+			return; // Silently skip evaluating on frames between retries
 		}
 	}
 
