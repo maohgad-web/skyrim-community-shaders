@@ -493,7 +493,7 @@ void NeuralNR::PostPostLoad()
 	{ logger::info("NeuralNR: GetCapabilityParameters failed"); return; }
 
 	// CRITICAL FIX: Snippet Initialization
-	// As documented, snippet Init_Ext requires the parameter block (s.nrParams) in place of the Application Form info.
+	// As documented, snippet Init_Ext requires the Version BEFORE the Parameter block.
 	auto pfnSnippetInitExt = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_Init_Ext");
 	if (pfnSnippetInitExt)
 	{
@@ -501,8 +501,8 @@ void NeuralNR::PostPostLoad()
 			unsigned long long InApplicationId,
 			const wchar_t* InApplicationDataPath,
 			ID3D11Device* InDevice,
-			NVSDK_NGX_Parameter* InParameters, 
-			NVSDK_NGX_Version InSDKVersion);
+			NVSDK_NGX_Version InSDKVersion,
+			NVSDK_NGX_Parameter* InParameters);
 
 		CSS::CallerSpoof::Install(); // Secure the validation gate before calling the snippet init
 		
@@ -510,8 +510,8 @@ void NeuralNR::PostPostLoad()
 			231313132ULL, 
 			appPath.c_str(), 
 			globals::d3d::device, 
-			s.nrParams, 
-			NVSDK_NGX_Version_API
+			NVSDK_NGX_Version_API, 
+			s.nrParams 
 		);
 		
 		if (!NVSDK_NGX_SUCCEED(snippetInitRes))
