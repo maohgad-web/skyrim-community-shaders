@@ -1,81 +1,41 @@
 #include "Features/NeuralNR/CallerSpoof.h"
-#include "Features/NeuralNR.h"
 #include "Utils/FileSystem.h"
 #include "Globals.h"
 #include <windows.h>
-#include <vector>
+#include <filesystem>
 
 namespace CSS::CallerSpoof
 {
-	enum slFeature : uint32_t { kFeatureDLSS_NR = 1004 }; 
-	
-	struct slPreferences {
-		bool showConsole;
-		int logLevel;
-		void* pathsToPlugins;
-		uint32_t numPathsToPlugins;
-		const slFeature* featuresToLoad;
-		uint32_t numFeaturesToLoad;
-		uint32_t renderAPI;
-	};
+	using GetModuleFileNameW_t = DWORD(WINAPI*)(HMODULE, LPWSTR, DWORD);
+	static GetModuleFileNameW_t s_origK32 = nullptr;
+	static HMODULE s_ourModule = nullptr;
 
-	typedef int (*slInit_t)(const slPreferences*, void*, void*);
-	typedef int (*slIsFeatureSupported_t)(slFeature, const void*);
-	
-	static slInit_t s_orig_slInit = nullptr;
-	static slIsFeatureSupported_t s_orig_slIsFeatureSupported = nullptr;
-	static std::vector<slFeature> s_modifiedFeatures;
-
-	using PFN_EvaluateFeature = NVSDK_NGX_Result (*)(ID3D11DeviceContext*, NVSDK_NGX_Handle*, NVSDK_NGX_Parameter*, void*);
-	static PFN_EvaluateFeature s_orig_NGXEvaluate = nullptr;
-
-	static NVSDK_NGX_Result Hooked_NGXEvaluate(ID3D11DeviceContext* ctx, NVSDK_NGX_Handle* feat, NVSDK_NGX_Parameter* param, void* info)
+	static DWORD WINAPI HookedK32(HMODULE hModule, LPWSTR lpFilename, DWORD nSize)
 	{
-		auto& s = NeuralNR::GetState();
-		
-		// Steal ONLY the parameter block, NOT the handle (which belongs to DLSS-SR).
-		if (!s.streamlineContextCaptured && param)
+		// CRITICAL FIX: Only spoof queries targeting OUR plugin module (s_ourModule).
+		// DO NOT spoof NULL. NGX needs to see the real Skyrim executable to apply
+		// driver profiles. Spoofing NULL on 560+ drivers triggers 0xBAD0000C.
+		if (hModule == s_ourModule && lpFilename && nSize > 0)
 		{
-			logger::info("NeuralNR [Streamline]: DLSS pipeline intercepted! Stealing globally validated NGX_Parameter block.");
-			s.nrParams = param;
-			s.streamlineContextCaptured = true;
-		}
-
-		return s_orig_NGXEvaluate(ctx, feat, param, info);
-	}
-
-	int Hooked_slInit(const slPreferences* pref, void* app, void* device)
-	{
-		logger::info("NeuralNR [Streamline]: Intercepted slInit. Modifying plugin array...");
-		
-		slPreferences modPref = *pref;
-		s_modifiedFeatures.clear();
-		
-		bool nrFound = false;
-		if (pref->featuresToLoad && pref->numFeaturesToLoad > 0) {
-			for (uint32_t i = 0; i < pref->numFeaturesToLoad; ++i) {
-				s_modifiedFeatures.push_back(pref->featuresToLoad[i]);
-				if (pref->featuresToLoad[i] == kFeatureDLSS_NR) nrFound = true;
+			const wchar_t* spoof = L"C:\\Windows\\System32\\nvngx.dll";
+			const DWORD len = static_cast<DWORD>(wcslen(spoof));
+			if (len >= nSize)
+			{
+				wcsncpy_s(lpFilename, nSize, spoof, _TRUNCATE);
+				SetLastError(ERROR_INSUFFICIENT_BUFFER);
+				return nSize;
 			}
+			wcscpy_s(lpFilename, nSize, spoof);
+			SetLastError(ERROR_SUCCESS);
+			return len;
 		}
-		
-		if (!nrFound) {
-			logger::info("NeuralNR [Streamline]: Dynamically injecting Feature 1004 (Neural Rendering) into sl::Preferences.");
-			s_modifiedFeatures.push_back(kFeatureDLSS_NR);
-			modPref.featuresToLoad = s_modifiedFeatures.data();
-			modPref.numFeaturesToLoad = static_cast<uint32_t>(s_modifiedFeatures.size());
-		}
-		
-		return s_orig_slInit(&modPref, app, device);
+
+		// Forward all other module lookups normally (including NULL / SkyrimSE.exe)
+		if (s_origK32) return s_origK32(hModule, lpFilename, nSize);
+		return 0;
 	}
 
-	int Hooked_slIsFeatureSupported(slFeature feature, const void* pArch)
-	{
-		if (feature == kFeatureDLSS_NR) return 0; 
-		return s_orig_slIsFeatureSupported(feature, pArch);
-	}
-
-	static void PatchModuleIATAny(HMODULE hTargetModule, const char* targetFunction, void* hookFunc, void** origFunc)
+	static void PatchModuleIATAny(HMODULE hTargetModule, const char* targetFunction)
 	{
 		if (!hTargetModule) return;
 
@@ -105,8 +65,8 @@ namespace CSS::CallerSpoof
 						DWORD oldProtect;
 						if (VirtualProtect(&firstThunk->u1.Function, sizeof(uintptr_t), PAGE_READWRITE, &oldProtect))
 						{
-							if (origFunc && !*origFunc) *origFunc = (void*)firstThunk->u1.Function;
-							firstThunk->u1.Function = (uintptr_t)hookFunc;
+							if (!s_origK32) s_origK32 = (GetModuleFileNameW_t)firstThunk->u1.Function;
+							firstThunk->u1.Function = (uintptr_t)HookedK32;
 							VirtualProtect(&firstThunk->u1.Function, sizeof(uintptr_t), oldProtect, &oldProtect);
 						}
 					}
@@ -118,27 +78,36 @@ namespace CSS::CallerSpoof
 		}
 	}
 
-	void InstallStreamlineHooks()
+	void Install()
 	{
-		HMODULE hUpscaler = GetModuleHandleW(L"SkyrimUpscaler.dll"); 
-		if (!hUpscaler) hUpscaler = GetModuleHandleW(L"FSR2.dll");
-		if (!hUpscaler) hUpscaler = GetModuleHandleW(NULL); 
+		// Capture our own plugin handle for the spoof target
+		GetModuleHandleExW(
+			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCWSTR>(&Install),
+			&s_ourModule);
+
+		HMODULE hCore = GetModuleHandleW(L"_nvngx.dll");
+		HMODULE hNGX  = GetModuleHandleW(L"nvngx.dll");
 		
-		PatchModuleIATAny(hUpscaler, "slInit", (void*)Hooked_slInit, (void**)&s_orig_slInit);
-		PatchModuleIATAny(hUpscaler, "slIsFeatureSupported", (void*)Hooked_slIsFeatureSupported, (void**)&s_orig_slIsFeatureSupported);
-
-		// Hook the active interposer pipeline to catch the DLSS-SR evaluation command
-		HMODULE hInterposer = GetModuleHandleW(L"sl.interposer.dll");
-		if (!hInterposer) hInterposer = GetModuleHandleW(L"sl.dlss.dll");
-
-		if (hInterposer) {
-			PatchModuleIATAny(hInterposer, "NVSDK_NGX_D3D11_EvaluateFeature", (void*)Hooked_NGXEvaluate, (void**)&s_orig_NGXEvaluate);
-			logger::info("NeuralNR: Streamline IAT hooks installed successfully. Ready to intercept DLSS execution.");
-		} else {
-			logger::warn("NeuralNR: Streamline plugins not found in memory. IAT payload steal deferred.");
+		HMODULE hNR = GetModuleHandleW(L"nvngx_dlssnr.dll");
+		if (!hNR) 
+		{
+			auto path = Util::PathHelpers::GetFeatureShaderPath("NeuralNR") / L"nvngx_dlssnr.dll";
+			if (!std::filesystem::exists(path)) {
+				path = Util::PathHelpers::GetShadersPath() / L"Upscaling" / L"Streamline" / L"nvngx_dlssnr.dll";
+			}
+			hNR = LoadLibraryW(path.c_str());
 		}
+
+		if (hCore) PatchModuleIATAny(hCore, "GetModuleFileNameW");
+		if (hNGX)  PatchModuleIATAny(hNGX,  "GetModuleFileNameW");
+		if (hNR)   PatchModuleIATAny(hNR,   "GetModuleFileNameW");
+
+		logger::info("NeuralNR: IAT caller-spoof installed (hCore={}, hNGX={}, hNR={}).",
+			hCore != nullptr, hNGX != nullptr, hNR != nullptr);
 	}
 
-	void Install() {}
-	void Uninstall() {}
+	void Uninstall()
+	{
+	}
 }
