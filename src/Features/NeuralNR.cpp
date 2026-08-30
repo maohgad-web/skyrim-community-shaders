@@ -16,6 +16,7 @@
 
 namespace
 {
+	// Confirmed via documentation: DLSS Neural Rendering is Feature 18.
 	constexpr int kFeatureDLSSNR = 18;
 
 	using PFN_InitExt            = decltype(&NVSDK_NGX_D3D11_Init);
@@ -57,13 +58,6 @@ void NeuralNR::LoadDLL()
 {
 	auto& s = GetState();
 
-	// PATCH: check for an ALREADY-loaded core first via GetModuleHandleW.
-	// Streamline/Upscaling loads the real core using NVIDIA's own driver-
-	// store discovery — it lives nested under
-	// DriverStore\FileRepository\<package>\, not on Windows' standard DLL
-	// search path, so a bare LoadLibraryW(L"_nvngx.dll") can't find it.
-	// LoadLibraryW is kept as a last-resort fallback (costs nothing to try,
-	// even though it will likely fail for the same reason).
 	s.hDLL = GetModuleHandleW(L"_nvngx.dll");
 	if (!s.hDLL) s.hDLL = GetModuleHandleW(L"nvngx.dll");
 	if (!s.hDLL) s.hDLL = LoadLibraryW(L"nvngx.dll");
@@ -72,11 +66,6 @@ void NeuralNR::LoadDLL()
 	if (!s.hDLL)
 	{
 		logger::warn("NeuralNR: Could not find the core NGX library (nvngx.dll or _nvngx.dll) — Streamline/DLSS may not have initialized it yet.");
-		// PATCH: don't return here. The snippet DLL below uses a full known
-		// path and doesn't depend on the core being found at this exact
-		// moment — no reason to block it on an unrelated failure. Callers
-		// retry LoadDLL() later (see OnPresent), so the core will be
-		// re-checked on a subsequent attempt without reloading the snippet.
 	}
 	else
 	{
@@ -165,10 +154,10 @@ bool NeuralNR::CreateFeature()
 	if (!s.pfnCreateFeature || !s.nrParams) return false;
 
 	CSS::CallerSpoof::Install();
+	
 	NVSDK_NGX_Result res = ((PFN_CreateFeature)s.pfnCreateFeature)(
 		globals::d3d::context, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), s.nrParams, &s.nrFeature);
-	CSS::CallerSpoof::Uninstall();
-
+		
 	if (!NVSDK_NGX_SUCCEED(res) || !s.nrFeature)
 	{
 		logger::error("NeuralNR: CreateFeature failed, res=0x{:X}", static_cast<uint32_t>(res));
@@ -315,17 +304,10 @@ void NeuralNR::OnPresent()
 	auto& s = GetState();
 	if (!s.initialized)
 	{
-		// PATCH: was a permanent one-shot (static bool, set once forever) —
-		// it ran on the very first rendered frame, almost certainly before
-		// Streamline had loaded the real NGX core for its own DLSS SR/FG
-		// use, and a failure there meant it could never succeed later even
-		// once the core did become available. Now retries periodically
-		// (not every frame, to avoid hammering LoadLibrary/GetProcAddress
-		// needlessly) until it succeeds, up to a generous attempt cap.
 		static uint32_t s_retryFrameCounter = 0;
 		static uint32_t s_setupAttempts = 0;
-		constexpr uint32_t kSetupRetryIntervalFrames = 120; // ~2s at 60fps
-		constexpr uint32_t kMaxSetupAttempts = 300;         // ~10 minutes of retrying
+		constexpr uint32_t kSetupRetryIntervalFrames = 120;
+		constexpr uint32_t kMaxSetupAttempts = 300;
 
 		const bool firstAttempt = (s_setupAttempts == 0);
 		const bool dueForRetry  = (++s_retryFrameCounter >= kSetupRetryIntervalFrames) && (s_setupAttempts < kMaxSetupAttempts);
@@ -339,10 +321,6 @@ void NeuralNR::OnPresent()
 
 	if (!s.pfnEvaluateFeature || !s.nrParams) 
 	{
-		// PATCH: no longer force settings.enabled = false here — that
-		// overrode the user's own checkbox and masked the fact that setup
-		// was never actually being retried. Just wait quietly for the core
-		// library to become available and try again on a later frame.
 		return;
 	}
 
@@ -356,12 +334,9 @@ void NeuralNR::OnPresent()
 
 	auto* P = s.nrParams;
 
-	// FIX: Use the specific DLSSNR namespace for creation parameters.
-	// Bypassing this causes the snippet to read 0x0 size and return 0xBAD00007.
 	P->Set("DLSSNR.Width",  (int)w);
 	P->Set("DLSSNR.Height", (int)h);
 	
-	// Set standard block variables as a fallback for the NGX core interposer
 	P->Set(NVSDK_NGX_Parameter_Width,  (int)w);
 	P->Set(NVSDK_NGX_Parameter_Height, (int)h);
 	P->Set(NVSDK_NGX_Parameter_OutWidth,  (int)w);
@@ -486,6 +461,7 @@ void NeuralNR::PostPostLoad()
 	featureInfo.PathListInfo.Path = searchPaths;
 	featureInfo.PathListInfo.Length = 1;
 
+	// Core Init
 	NVSDK_NGX_Result initRes = ((PFN_InitExt)s.pfnInitExt)(
 		231313132ULL, 
 		appPath.c_str(), 
@@ -496,7 +472,7 @@ void NeuralNR::PostPostLoad()
 
 	if (!NVSDK_NGX_SUCCEED(initRes))
 	{ 
-		logger::warn("NeuralNR: Init_Ext failed with result code: 0x{:X}. Proceeding to allocate parameters via Streamline context...", static_cast<uint32_t>(initRes)); 
+		logger::warn("NeuralNR: Core Init_Ext failed with result code: 0x{:X}. Proceeding to allocate parameters via Streamline context...", static_cast<uint32_t>(initRes)); 
 	}
 
 	if (!s.pfnGetCapabilityParameters)
@@ -506,7 +482,39 @@ void NeuralNR::PostPostLoad()
 
 	if (!NVSDK_NGX_SUCCEED(capRes) || !s.nrParams)
 	{ logger::info("NeuralNR: GetCapabilityParameters failed"); return; }
-	
+
+	// CRITICAL FIX: Snippet Initialization
+	// As documented, snippet Init_Ext requires the parameter block (s.nrParams) in place of the Application Form info.
+	auto pfnSnippetInitExt = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_Init_Ext");
+	if (pfnSnippetInitExt)
+	{
+		using PFN_SnippetInitExt = NVSDK_NGX_Result (*)(
+			unsigned long long InApplicationId,
+			const wchar_t* InApplicationDataPath,
+			ID3D11Device* InDevice,
+			NVSDK_NGX_Parameter* InParameters, 
+			NVSDK_NGX_Version InSDKVersion);
+
+		CSS::CallerSpoof::Install(); // Secure the validation gate before calling the snippet init
+		
+		NVSDK_NGX_Result snippetInitRes = ((PFN_SnippetInitExt)pfnSnippetInitExt)(
+			231313132ULL, 
+			appPath.c_str(), 
+			globals::d3d::device, 
+			s.nrParams, 
+			NVSDK_NGX_Version_API
+		);
+		
+		if (!NVSDK_NGX_SUCCEED(snippetInitRes))
+			logger::warn("NeuralNR: Snippet Init_Ext failed with result code: 0x{:X}", static_cast<uint32_t>(snippetInitRes));
+		else
+			logger::info("NeuralNR: Snippet initialized successfully!");
+	}
+	else
+	{
+		logger::warn("NeuralNR: Could not find NVSDK_NGX_D3D11_Init_Ext in snippet DLL.");
+	}
+
 	if (s.pfnPopulateParams)
 	{
 		using PFN_Populate = NVSDK_NGX_Result (*)(NVSDK_NGX_Parameter*);
