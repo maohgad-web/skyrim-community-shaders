@@ -410,7 +410,6 @@ void NeuralNR::OnPresent()
 	if (s.w != w || s.h != h) s.needsReset = true;
 	CreateResources(w, h, dsc.Format);
 
-	// --- CRITICAL FIX: The 3D Scene Gate ---
 	// Completely block snippet initialization and evaluation until the 3D world is active.
 	if (!s.mvSRV || !s.depthSRV) 
 	{
@@ -443,17 +442,27 @@ void NeuralNR::OnPresent()
 	if (!s.initialized)
 	{
 		static uint32_t s_createRetry = 0;
+		static uint32_t s_cooldownFrames = 0;
 		static int s_strategy = 1;
 		static bool s_snippetInitialized = false;
 
+		// If cooldown is active, decrement and abort the frame
+		if (s_cooldownFrames > 0)
+		{
+			s_cooldownFrames--;
+			back->Release();
+			return;
+		}
+
 		if (s_createRetry++ % 60 == 0) 
 		{
-			// CRITICAL FIX: Infinite Graceful Retries
+			// Safe Infinite Retries: Enforces a 600-frame cooldown without integer underflow
 			if (s_strategy > 4) {
 				logger::error("NeuralNR: Matrix exhausted. Restarting handshake loop in 10 seconds...");
 				s_strategy = 1; 
 				s_snippetInitialized = false;
-				s_createRetry = -600; // 10 second cooldown (600 frames) before restarting
+				s_cooldownFrames = 600; 
+				s_createRetry = 0;
 				back->Release();
 				return;
 			}
@@ -503,7 +512,6 @@ void NeuralNR::OnPresent()
 						globals::d3d::device, NVSDK_NGX_Version_API, &featureInfo, &faulted);
 				}
 				else if (s_strategy == 4) {
-					// Strategy 4 Restored: Bypasses Init completely
 					logger::info("NeuralNR: Strategy 4 -> Bypass Snippet Init, direct Parameter Population");
 					snippetInitRes = static_cast<NVSDK_NGX_Result>(1); 
 				}
@@ -547,8 +555,6 @@ void NeuralNR::OnPresent()
 		}
 	}
 
-	// CRITICAL FIX: The Hardware Lock
-	// Never allow EvaluateFeature to fire if the hardware tensor allocation failed.
 	if (!s.nrFeature)
 	{
 		back->Release();
