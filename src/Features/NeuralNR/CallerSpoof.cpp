@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <thread>
 #include <vector>
+#include <string>
 
 namespace CSS::CallerSpoof
 {
@@ -13,6 +14,17 @@ namespace CSS::CallerSpoof
 
 	using PFN_EvaluateFeature = NVSDK_NGX_Result (*)(ID3D11DeviceContext*, NVSDK_NGX_Handle*, NVSDK_NGX_Parameter*, void*);
 	static PFN_EvaluateFeature s_orig_NGXEvaluate = nullptr;
+
+	// PATCH: slOnPluginLoad's real signature is unconfirmed here — the guide
+	// credits it to a third-party report on a different game under D3D12,
+	// not this D3D11 environment. Treated as generically/safely as possible:
+	// a single opaque context pointer, matching the guide's own description
+	// ("captures that object"). Deliberately NOT dereferencing its contents
+	// yet — only logging the raw pointer value — until DumpModuleImports
+	// confirms this name (or something like it) actually exists here, and
+	// ideally until its real layout is confirmed rather than guessed.
+	using PFN_slOnPluginLoad = void* (*)(void*);
+	static PFN_slOnPluginLoad s_orig_slOnPluginLoad = nullptr;
 
 	using GetProcAddress_t = FARPROC(WINAPI*)(HMODULE, LPCSTR);
 	static GetProcAddress_t s_origGetProcAddress = nullptr;
@@ -135,10 +147,45 @@ namespace CSS::CallerSpoof
 		return static_cast<NVSDK_NGX_Result>(0xBAD00007);
 	}
 
+	static void* WINAPI Hooked_slOnPluginLoad(void* pluginContext)
+	{
+		// Log the call and the raw pointer first, before touching anything —
+		// confirms the hook fired at all regardless of what happens next.
+		logger::info("NeuralNR [Diag]: slOnPluginLoad intercepted! context={}", pluginContext);
+
+		if (s_orig_slOnPluginLoad) {
+			__try {
+				return s_orig_slOnPluginLoad(pluginContext);
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				logger::warn("NeuralNR [Diag]: SEH caught crash forwarding to original slOnPluginLoad — signature guess was likely wrong.");
+				return pluginContext; // best-effort passthrough rather than losing the value entirely
+			}
+		}
+		return pluginContext;
+	}
+
 	static FARPROC WINAPI Hooked_GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
 	{
 		if (lpProcName && ((ULONG_PTR)lpProcName > 0xFFFF))
 		{
+			// PATCH: log EVERY distinct symbol name looked up on our hooked
+			// modules, not just the ones we react to. This is the actual
+			// "stop guessing" step — rather than trying one name at a time
+			// across separate builds, this dumps every real dynamic lookup
+			// Streamline's D3D11 plugins make in a single test run. Dedup'd
+			// by name so a hot lookup path doesn't flood the log.
+			{
+				static std::vector<std::string> s_loggedNames;
+				bool alreadyLogged = false;
+				for (const auto& n : s_loggedNames) {
+					if (_stricmp(n.c_str(), lpProcName) == 0) { alreadyLogged = true; break; }
+				}
+				if (!alreadyLogged) {
+					s_loggedNames.emplace_back(lpProcName);
+					logger::info("NeuralNR [Dump]: GetProcAddress lookup for: {}", lpProcName);
+				}
+			}
+
 			if (_stricmp(lpProcName, "NVSDK_NGX_D3D11_CreateFeature") == 0)
 			{
 				if (!s_orig_NGXCreate) s_orig_NGXCreate = (PFN_CreateFeature)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
@@ -148,6 +195,11 @@ namespace CSS::CallerSpoof
 			{
 				if (!s_orig_NGXEvaluate) s_orig_NGXEvaluate = (PFN_EvaluateFeature)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
 				return (FARPROC)Hooked_NGXEvaluate;
+			}
+			if (_stricmp(lpProcName, "slOnPluginLoad") == 0)
+			{
+				if (!s_orig_slOnPluginLoad) s_orig_slOnPluginLoad = (PFN_slOnPluginLoad)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
+				return (FARPROC)Hooked_slOnPluginLoad;
 			}
 		}
 		
@@ -198,6 +250,59 @@ namespace CSS::CallerSpoof
 		}
 	}
 
+	// PATCH: safe, READ-ONLY diagnostic — no patching, no calling, just
+	// walking and logging every import table entry a module actually has.
+	// This directly answers the ordinal question from last message (are
+	// NVSDK_NGX_D3D11_CreateFeature/EvaluateFeature genuinely absent by
+	// name, or ordinal-only?) and gives full visibility into what THIS
+	// specific D3D11 build's Streamline plugins actually call, instead of
+	// continuing to guess names one at a time from a Vulkan/D3D12 report.
+	// Ordinal-only entries are logged as "ordinal N" since there's no name
+	// to print, but they ARE logged (PatchModuleIATAny above still skips
+	// them for patching purposes — this is purely informational).
+	static void DumpModuleImports(HMODULE hTargetModule, const char* moduleNameForLog)
+	{
+		if (!hTargetModule) return;
+
+		PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)hTargetModule;
+		if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return;
+
+		PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((BYTE*)hTargetModule + dosHeader->e_lfanew);
+		if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return;
+
+		DWORD importDirRVA = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+		if (!importDirRVA)
+		{
+			logger::info("NeuralNR [Dump]: {} has no import table.", moduleNameForLog);
+			return;
+		}
+
+		PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)((BYTE*)hTargetModule + importDirRVA);
+
+		while (importDesc->Name)
+		{
+			const char* dllName = (const char*)((BYTE*)hTargetModule + importDesc->Name);
+			PIMAGE_THUNK_DATA originalFirstThunk = (PIMAGE_THUNK_DATA)((BYTE*)hTargetModule + importDesc->OriginalFirstThunk);
+
+			while (originalFirstThunk->u1.AddressOfData)
+			{
+				if (originalFirstThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG)
+				{
+					logger::info("NeuralNR [Dump]: {} imports from {}: ordinal {}",
+						moduleNameForLog, dllName, static_cast<uint32_t>(IMAGE_ORDINAL(originalFirstThunk->u1.Ordinal)));
+				}
+				else
+				{
+					PIMAGE_IMPORT_BY_NAME importByName = (PIMAGE_IMPORT_BY_NAME)((BYTE*)hTargetModule + originalFirstThunk->u1.AddressOfData);
+					logger::info("NeuralNR [Dump]: {} imports from {}: {}",
+						moduleNameForLog, dllName, (const char*)importByName->Name);
+				}
+				originalFirstThunk++;
+			}
+			importDesc++;
+		}
+	}
+
 	// PATCH: the header (CallerSpoof.h) declares InstallUpscalerHooks() and
 	// InstallActiveInterceptors() — this file previously defined neither,
 	// only a differently-named InstallStreamlineHooks(), which meant both
@@ -239,32 +344,27 @@ namespace CSS::CallerSpoof
 				HMODULE hMod = GetModuleHandleW(s_targetModules[i]);
 				if (hMod)
 				{
-					PatchModuleIATAny(hMod, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
+	PatchModuleIATAny(hMod, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
 
-					// PATCH: alongside the GetProcAddress hijack (which only
-					// catches a FUTURE dynamic lookup), also directly patch
-					// this module's own IAT entries for CreateFeature/
-					// EvaluateFeature by name if it imports them at all. This
-					// catches the case the GetProcAddress hook structurally
-					// can't: a static import resolved by the Windows loader
-					// at load time (no runtime GetProcAddress call ever
-					// happens for it), or a dynamic lookup that already
-					// completed before our hooks attached. Confirmed twice
-					// now (two separate test sessions) that GetProcAddress
-					// alone never caught a single CreateFeature/
-					// EvaluateFeature call despite DLSS SR running the whole
-					// time — this is the direct-patch fallback for that gap.
-					// Harmless no-op on any module that doesn't import these
-					// by name at all (PatchModuleIATAny just won't find a
-					// matching entry to patch).
+					// Direct by-name IAT patches (bypasses the "was it
+					// resolved before our hook attached / via a static
+					// import" gap entirely — works on whatever's already in
+					// the IAT regardless of how it got there).
 					PatchModuleIATAny(hMod, "NVSDK_NGX_D3D11_CreateFeature", (void*)Hooked_NGXCreate, (void**)&s_orig_NGXCreate);
 					PatchModuleIATAny(hMod, "NVSDK_NGX_D3D11_EvaluateFeature", (void*)Hooked_NGXEvaluate, (void**)&s_orig_NGXEvaluate);
+					PatchModuleIATAny(hMod, "slOnPluginLoad", (void*)Hooked_slOnPluginLoad, (void**)&s_orig_slOnPluginLoad);
 
 					char logName[64];
 					size_t converted = 0;
 					wcstombs_s(&converted, logName, sizeof(logName), s_targetModules[i], _TRUNCATE);
 
-					logger::info("NeuralNR [Diag]: Successfully attached GetProcAddress + direct CreateFeature/EvaluateFeature hijack to {}.", logName);
+					// PATCH: safe, read-only dump of every import this module
+					// actually has — settles the ordinal question and shows
+					// real D3D11-environment lifecycle names instead of
+					// continuing to guess from a Vulkan/D3D12 report.
+					DumpModuleImports(hMod, logName);
+
+					logger::info("NeuralNR [Diag]: Successfully attached GetProcAddress + direct CreateFeature/EvaluateFeature/slOnPluginLoad hijack to {}.", logName);
 					s_hookedStatus[i] = true;
 				}
 				else
