@@ -385,29 +385,14 @@ void NeuralNR::OnPresent()
 {
 	if (!settings.enabled) return;
 
-	// CRITICAL FIX: Delay execution for ~5 seconds to clear the Bink Video (Bethesda Logo) phase.
-	// Bink allocates volatile Depth/MVec targets that trigger NGX evaluation crashes.
-	static uint32_t s_bootFrames = 0;
-	if (s_bootFrames < 400) {
-		s_bootFrames++;
-		return;
-	}
-
 	auto& s = GetState();
 
-	if (!s.initialized)
+	// Acquire core modules immediately
+	if (!s.pfnEvaluateFeature)
 	{
-		static uint32_t s_retryFrameCounter = 0;
-		static uint32_t s_setupAttempts = 0;
-		constexpr uint32_t kSetupRetryIntervalFrames = 120;
-		constexpr uint32_t kMaxSetupAttempts = 300;
-
-		const bool firstAttempt = (s_setupAttempts == 0);
-		const bool dueForRetry  = (++s_retryFrameCounter >= kSetupRetryIntervalFrames) && (s_setupAttempts < kMaxSetupAttempts);
-		if (firstAttempt || dueForRetry)
-		{
-			s_retryFrameCounter = 0;
-			++s_setupAttempts;
+		static bool attemptedLoad = false;
+		if (!attemptedLoad) {
+			attemptedLoad = true;
 			PostPostLoad();
 		}
 	}
@@ -424,6 +409,17 @@ void NeuralNR::OnPresent()
 	const uint32_t w = dsc.Width, h = dsc.Height;
 	if (s.w != w || s.h != h) s.needsReset = true;
 	CreateResources(w, h, dsc.Format);
+
+	// --- CRITICAL FIX: The 3D Scene Gate ---
+	// Completely block snippet initialization and evaluation until the 3D world is active.
+	if (!s.mvSRV || !s.depthSRV) 
+	{
+		static uint32_t s_resourceWaitCounter = 0;
+		if (++s_resourceWaitCounter % 300 == 1)
+			logger::info("NeuralNR: Waiting for active 3D scene (Depth/MVec) before handshake...");
+		back->Release(); 
+		return; 
+	}
 
 	auto* P = s.nrParams;
 	P->Set("DLSSNR.Width",  (int)w);
@@ -452,9 +448,12 @@ void NeuralNR::OnPresent()
 
 		if (s_createRetry++ % 60 == 0) 
 		{
-			if (s_strategy > 3) {
-				logger::error("NeuralNR: All valid initialization strategies exhausted. Feature permanently disabled.");
-				s.initialized = true; 
+			// CRITICAL FIX: Infinite Graceful Retries
+			if (s_strategy > 4) {
+				logger::error("NeuralNR: Matrix exhausted. Restarting handshake loop in 10 seconds...");
+				s_strategy = 1; 
+				s_snippetInitialized = false;
+				s_createRetry = -600; // 10 second cooldown (600 frames) before restarting
 				back->Release();
 				return;
 			}
@@ -503,6 +502,11 @@ void NeuralNR::OnPresent()
 						reinterpret_cast<FARPROC>(pfnInitExt), 231313132ULL, appPath.c_str(),
 						globals::d3d::device, NVSDK_NGX_Version_API, &featureInfo, &faulted);
 				}
+				else if (s_strategy == 4) {
+					// Strategy 4 Restored: Bypasses Init completely
+					logger::info("NeuralNR: Strategy 4 -> Bypass Snippet Init, direct Parameter Population");
+					snippetInitRes = static_cast<NVSDK_NGX_Result>(1); 
+				}
 
 				CSS::CallerSpoof::Uninstall();
 
@@ -526,7 +530,9 @@ void NeuralNR::OnPresent()
 			if (s_snippetInitialized && !s.nrFeature) {
 				if (CreateFeature()) {
 					s.initialized = true;
+					logger::info("NeuralNR: Initialization fully stabilized on Strategy {}.", s_strategy);
 				} else {
+					logger::warn("NeuralNR: CreateFeature rejected Strategy {}. Advancing matrix...", s_strategy);
 					s_snippetInitialized = false; 
 					s_strategy++;
 					back->Release();
@@ -541,15 +547,12 @@ void NeuralNR::OnPresent()
 		}
 	}
 
-	if (!s.inputColor || !s.nrOutputTex || !s.mvSRV || !s.depthSRV) 
+	// CRITICAL FIX: The Hardware Lock
+	// Never allow EvaluateFeature to fire if the hardware tensor allocation failed.
+	if (!s.nrFeature)
 	{
-		static uint32_t s_resourceWaitCounter = 0;
-		if (++s_resourceWaitCounter % 300 == 1)
-		{
-			logger::info("NeuralNR: Feature created! Waiting for active scene render targets...");
-		}
-		back->Release(); 
-		return; 
+		back->Release();
+		return;
 	}
 
 	const bool hdr = IsActuallyHDROutput(globals::d3d::swapChain);
@@ -584,7 +587,6 @@ void NeuralNR::OnPresent()
 	P->Set("DLSSNR.MVec",   mvecRes);
 	P->Set("DLSSNR.Depth",  depthRes);
 
-	// CRITICAL FIX: Inject mandatory Jitter pointers and core capability keys to prevent RDI null dereference
 	P->Set("Color",         colorRes);
 	P->Set("Output",        outRes);
 	P->Set("MotionVectors", mvecRes);
