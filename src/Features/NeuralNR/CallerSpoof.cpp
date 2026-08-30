@@ -167,52 +167,72 @@ namespace CSS::CallerSpoof
 		}
 	}
 
-	static void StreamlineHookThread()
+	// PATCH: the header (CallerSpoof.h) declares InstallUpscalerHooks() and
+	// InstallActiveInterceptors() — this file previously defined neither,
+	// only a differently-named InstallStreamlineHooks(), which meant both
+	// declared functions were unresolved-external at link time (NeuralNR.cpp
+	// calls both). Restructured so both real names exist, sharing one
+	// idempotent core so calling it repeatedly (every frame, from OnPresent)
+	// is cheap once everything's already hooked.
+	//
+	// NOTE — thread-safety worth knowing about: this shared state
+	// (s_hookedStatus / s_origGetProcAddress) is now touched both from the
+	// background polling thread (InstallUpscalerHooks) and from the main
+	// render thread (InstallActiveInterceptors, called every frame from
+	// OnPresent) with no locking between them. In practice the window is
+	// narrow — each entry only transitions its status once — but it's a
+	// genuine, unaddressed data race, not just a style nitpick. Flagging it
+	// rather than silently leaving it, since it's outside what was asked
+	// (compile errors) but directly relevant to this exact restructure.
+	static const wchar_t* s_targetModules[] = {
+		L"sl.interposer.dll",
+		L"sl.common.dll",
+		L"sl.dlss.dll",
+		L"sl.dlss_g.dll",
+		L"sl.dlss_nr.dll",
+		L"sl.reflex.dll",
+		L"sl.nis.dll",
+		L"sl.pcl.dll",
+		L"nvngx.dll",
+		L"_nvngx.dll"
+	};
+	static std::vector<bool> s_hookedStatus(std::size(s_targetModules), false);
+
+	bool InstallActiveInterceptors()
 	{
-		const wchar_t* targetModules[] = {
-			L"sl.interposer.dll",
-			L"sl.common.dll",
-			L"sl.dlss.dll",
-			L"sl.dlss_g.dll",
-			L"sl.dlss_nr.dll",
-			L"sl.reflex.dll",
-			L"sl.nis.dll",
-			L"sl.pcl.dll",
-			L"nvngx.dll",
-			L"_nvngx.dll"
-		};
+		bool allHooked = true;
+		for (size_t i = 0; i < std::size(s_targetModules); ++i)
+		{
+			if (!s_hookedStatus[i])
+			{
+				HMODULE hMod = GetModuleHandleW(s_targetModules[i]);
+				if (hMod)
+				{
+					PatchModuleIATAny(hMod, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
 
-		std::vector<bool> hookedStatus(std::size(targetModules), false);
-		int totalHooked = 0;
-		int targetCount = static_cast<int>(std::size(targetModules));
+					char logName[64];
+					size_t converted = 0;
+					wcstombs_s(&converted, logName, sizeof(logName), s_targetModules[i], _TRUNCATE);
 
-		while (totalHooked < targetCount) {
-			for (int i = 0; i < targetCount; ++i) {
-				if (!hookedStatus[i]) {
-					HMODULE hMod = GetModuleHandleW(targetModules[i]);
-					if (hMod) {
-						PatchModuleIATAny(hMod, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
-						
-						// Convert wchar_t to char safely for logging
-						char logName[64];
-						size_t converted = 0;
-						wcstombs_s(&converted, logName, sizeof(logName), targetModules[i], _TRUNCATE);
-						
-						logger::info("NeuralNR [Diag]: Successfully attached GetProcAddress hijack to {}.", logName);
-						hookedStatus[i] = true;
-						totalHooked++;
-					}
+					logger::info("NeuralNR [Diag]: Successfully attached GetProcAddress hijack to {}.", logName);
+					s_hookedStatus[i] = true;
+				}
+				else
+				{
+					allHooked = false;
 				}
 			}
-			Sleep(200);
 		}
-		
-		logger::info("NeuralNR [Diag]: All Streamline and NGX modules actively intercepted.");
+		return allHooked;
 	}
 
-	void InstallStreamlineHooks()
+	void InstallUpscalerHooks()
 	{
-		std::thread(StreamlineHookThread).detach();
+		std::thread([]() {
+			while (!InstallActiveInterceptors())
+				Sleep(200);
+			logger::info("NeuralNR [Diag]: All Streamline and NGX modules actively intercepted.");
+		}).detach();
 	}
 
 	void Install()
