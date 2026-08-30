@@ -23,7 +23,6 @@ namespace
 	using PFN_EvaluateFeature    = decltype(&NVSDK_NGX_D3D11_EvaluateFeature);
 	using PFN_ReleaseFeature     = decltype(&NVSDK_NGX_D3D11_ReleaseFeature);
 
-	// Standard Init signature (NVSDK_NGX_D3D11_Init): (AppId, Path, Device, FeatureCommonInfo, Version)
 	using PFN_InitExt_Std = NVSDK_NGX_Result (*)(
 		unsigned long long InApplicationId,
 		const wchar_t* InApplicationDataPath,
@@ -31,7 +30,6 @@ namespace
 		const NVSDK_NGX_FeatureCommonInfo* InFeatureInfo,
 		NVSDK_NGX_Version InSDKVersion);
 
-	// Strategy 1 signature (Snippet ABI: Version + Parameter Block)
 	using PFN_SnippetInit_Strategy1 = NVSDK_NGX_Result (*)(
 		unsigned long long InApplicationId,
 		const wchar_t* InApplicationDataPath,
@@ -39,20 +37,14 @@ namespace
 		NVSDK_NGX_Version InSDKVersion,
 		NVSDK_NGX_Parameter* InParameters);
 
-	// Strategy 2 signature (Standard NGX ABI: FeatureCommonInfo + Version)
 	using PFN_SnippetInit_Strategy2 = PFN_InitExt_Std;
 
-	// Strategy 3 signature (Flipped NGX ABI: Version + FeatureCommonInfo)
 	using PFN_SnippetInit_Strategy3 = NVSDK_NGX_Result (*)(
 		unsigned long long InApplicationId,
 		const wchar_t* InApplicationDataPath,
 		ID3D11Device* InDevice,
 		NVSDK_NGX_Version InSDKVersion,
 		const NVSDK_NGX_FeatureCommonInfo* InFeatureInfo);
-
-	// ---------------------------------------------------------------------------
-	// Layer 2: SEH-Guarded Callers (POD only, no C++ unwinding objects in scope)
-	// ---------------------------------------------------------------------------
 
 	NVSDK_NGX_Result CallSnippetInit_Strategy1_SEH(
 		FARPROC pfn,
@@ -64,13 +56,11 @@ namespace
 		bool* outFaulted)
 	{
 		if (outFaulted) *outFaulted = false;
-		__try
-		{
+		__try {
 			auto fn = reinterpret_cast<PFN_SnippetInit_Strategy1>(pfn);
 			return fn(appId, appPath, dev, ver, params);
 		}
-		__except (EXCEPTION_EXECUTE_HANDLER)
-		{
+		__except (EXCEPTION_EXECUTE_HANDLER) {
 			if (outFaulted) *outFaulted = true;
 			return static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
 		}
@@ -86,13 +76,11 @@ namespace
 		bool* outFaulted)
 	{
 		if (outFaulted) *outFaulted = false;
-		__try
-		{
+		__try {
 			auto fn = reinterpret_cast<PFN_SnippetInit_Strategy2>(pfn);
 			return fn(appId, appPath, dev, featInfo, ver);
 		}
-		__except (EXCEPTION_EXECUTE_HANDLER)
-		{
+		__except (EXCEPTION_EXECUTE_HANDLER) {
 			if (outFaulted) *outFaulted = true;
 			return static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
 		}
@@ -108,13 +96,11 @@ namespace
 		bool* outFaulted)
 	{
 		if (outFaulted) *outFaulted = false;
-		__try
-		{
+		__try {
 			auto fn = reinterpret_cast<PFN_SnippetInit_Strategy3>(pfn);
 			return fn(appId, appPath, dev, ver, featInfo);
 		}
-		__except (EXCEPTION_EXECUTE_HANDLER)
-		{
+		__except (EXCEPTION_EXECUTE_HANDLER) {
 			if (outFaulted) *outFaulted = true;
 			return static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
 		}
@@ -399,6 +385,14 @@ void NeuralNR::OnPresent()
 {
 	if (!settings.enabled) return;
 
+	// CRITICAL FIX: Delay execution for ~5 seconds to clear the Bink Video (Bethesda Logo) phase.
+	// Bink allocates volatile Depth/MVec targets that trigger NGX evaluation crashes.
+	static uint32_t s_bootFrames = 0;
+	if (s_bootFrames < 400) {
+		s_bootFrames++;
+		return;
+	}
+
 	auto& s = GetState();
 
 	if (!s.initialized)
@@ -458,8 +452,8 @@ void NeuralNR::OnPresent()
 
 		if (s_createRetry++ % 60 == 0) 
 		{
-			if (s_strategy > 4) {
-				logger::error("NeuralNR: All 4 initialization strategies exhausted. Feature permanently disabled.");
+			if (s_strategy > 3) {
+				logger::error("NeuralNR: All valid initialization strategies exhausted. Feature permanently disabled.");
 				s.initialized = true; 
 				back->Release();
 				return;
@@ -480,9 +474,7 @@ void NeuralNR::OnPresent()
 				featureInfo.PathListInfo.Length = 1;
 
 				auto pfnInitExt = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_Init_Ext");
-				if (!pfnInitExt && s_strategy != 4) {
-					pfnInitExt = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_Init");
-				}
+				if (!pfnInitExt) pfnInitExt = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_Init");
 
 				NVSDK_NGX_Result snippetInitRes = static_cast<NVSDK_NGX_Result>(-1);
 				bool faulted = false;
@@ -490,64 +482,41 @@ void NeuralNR::OnPresent()
 				CSS::CallerSpoof::Install();
 
 				if (s_strategy == 1 && pfnInitExt) {
-					logger::info("NeuralNR: Strategy 1 -> Snippet ABI + Dev/Avail Capability Injection (SEH Guarded)");
+					logger::info("NeuralNR: Strategy 1 -> Snippet ABI + Capability Injection");
 					s.nrParams->Set("DLSSNR.Available", 1);
 					s.nrParams->Set("SuperSampling.Available", 1);
 					s.nrParams->Set("NVSDK_NGX_Parameter_DevOverride", 1);
 					
 					snippetInitRes = CallSnippetInit_Strategy1_SEH(
-						reinterpret_cast<FARPROC>(pfnInitExt),
-						231313132ULL,
-						appPath.c_str(),
-						globals::d3d::device,
-						NVSDK_NGX_Version_API,
-						s.nrParams,
-						&faulted);
+						reinterpret_cast<FARPROC>(pfnInitExt), 231313132ULL, appPath.c_str(),
+						globals::d3d::device, NVSDK_NGX_Version_API, s.nrParams, &faulted);
 				}
 				else if (s_strategy == 2 && pfnInitExt) {
-					logger::info("NeuralNR: Strategy 2 -> Standard ABI (FeatureCommonInfo + Version) (SEH Guarded)");
+					logger::info("NeuralNR: Strategy 2 -> Standard ABI");
 					snippetInitRes = CallSnippetInit_Strategy2_SEH(
-						reinterpret_cast<FARPROC>(pfnInitExt),
-						231313132ULL,
-						appPath.c_str(),
-						globals::d3d::device,
-						&featureInfo,
-						NVSDK_NGX_Version_API,
-						&faulted);
+						reinterpret_cast<FARPROC>(pfnInitExt), 231313132ULL, appPath.c_str(),
+						globals::d3d::device, &featureInfo, NVSDK_NGX_Version_API, &faulted);
 				}
 				else if (s_strategy == 3 && pfnInitExt) {
-					logger::info("NeuralNR: Strategy 3 -> Flipped ABI (Version + FeatureCommonInfo) (SEH Guarded)");
+					logger::info("NeuralNR: Strategy 3 -> Flipped ABI");
 					snippetInitRes = CallSnippetInit_Strategy3_SEH(
-						reinterpret_cast<FARPROC>(pfnInitExt),
-						231313132ULL,
-						appPath.c_str(),
-						globals::d3d::device,
-						NVSDK_NGX_Version_API,
-						&featureInfo,
-						&faulted);
-				}
-				else if (s_strategy == 4) {
-					logger::info("NeuralNR: Strategy 4 -> Bypass Snippet Init, force Populated parameters (Zero-Risk Fallback)");
-					snippetInitRes = static_cast<NVSDK_NGX_Result>(1); // NVSDK_NGX_Result_Success
+						reinterpret_cast<FARPROC>(pfnInitExt), 231313132ULL, appPath.c_str(),
+						globals::d3d::device, NVSDK_NGX_Version_API, &featureInfo, &faulted);
 				}
 
 				CSS::CallerSpoof::Uninstall();
 
-				if (faulted) {
-					logger::error("NeuralNR: Strategy {} triggered an Access Violation (SEH caught & recovered safely).", s_strategy);
-				}
+				if (faulted) logger::error("NeuralNR: Strategy {} triggered an Access Violation (Recovered).", s_strategy);
 
 				if (NVSDK_NGX_SUCCEED(snippetInitRes) && !faulted) {
 					logger::info("NeuralNR: Strategy {} Snippet Handshake Succeeded!", s_strategy);
 					s_snippetInitialized = true;
-					
 					if (s.pfnPopulateParams) {
 						using PFN_Populate = NVSDK_NGX_Result (*)(NVSDK_NGX_Parameter*);
 						((PFN_Populate)s.pfnPopulateParams)(s.nrParams);
 					}
 				} else {
-					logger::warn("NeuralNR: Strategy {} Snippet Handshake Failed (0x{:X}, Faulted={})", 
-						s_strategy, static_cast<uint32_t>(snippetInitRes), faulted);
+					logger::warn("NeuralNR: Strategy {} Snippet Handshake Failed.", s_strategy);
 					s_strategy++;
 					back->Release();
 					return;
@@ -557,9 +526,7 @@ void NeuralNR::OnPresent()
 			if (s_snippetInitialized && !s.nrFeature) {
 				if (CreateFeature()) {
 					s.initialized = true;
-					logger::info("NeuralNR: Initialization fully stabilized on Strategy {}.", s_strategy);
 				} else {
-					logger::warn("NeuralNR: CreateFeature rejected Strategy {}. Resetting and advancing matrix...", s_strategy);
 					s_snippetInitialized = false; 
 					s_strategy++;
 					back->Release();
@@ -579,8 +546,7 @@ void NeuralNR::OnPresent()
 		static uint32_t s_resourceWaitCounter = 0;
 		if (++s_resourceWaitCounter % 300 == 1)
 		{
-			logger::info("NeuralNR: Feature created! Waiting for active scene render targets (Depth={}, MVec={})...",
-				s.depthSRV != nullptr, s.mvSRV != nullptr);
+			logger::info("NeuralNR: Feature created! Waiting for active scene render targets...");
 		}
 		back->Release(); 
 		return; 
@@ -607,26 +573,26 @@ void NeuralNR::OnPresent()
 	P->Set("DLSSNR.MVecScaleX",            settings.mvScaleX);
 	P->Set("DLSSNR.MVecScaleY",            settings.mvScaleY);
 	P->Set("DLSSNR.DepthInverted",         settings.depthInverted);
-	P->Set("NRPaperWhiteNits",             settings.paperWhiteNits);
-	P->Set("NREncodeStrength",             settings.encodeStrength);
 
-	// Resolve hardware pointers safely
 	auto colorRes = (ID3D11Resource*)(hdr ? s.sdrProxyTex : s.inputColor);
 	auto outRes   = (ID3D11Resource*)s.nrOutputTex;
 	auto mvecRes  = ResourceFromView(s.mvSRV);
 	auto depthRes = ResourceFromView(s.depthSRV);
 
-	// Map generic Streamline keys
 	P->Set("DLSSNR.Color",  colorRes);
 	P->Set("DLSSNR.Output", outRes);
 	P->Set("DLSSNR.MVec",   mvecRes);
 	P->Set("DLSSNR.Depth",  depthRes);
 
-	// CRITICAL FIX: Map strict core NGX capability keys to prevent internal NULL pointer dereferencing
+	// CRITICAL FIX: Inject mandatory Jitter pointers and core capability keys to prevent RDI null dereference
 	P->Set("Color",         colorRes);
 	P->Set("Output",        outRes);
 	P->Set("MotionVectors", mvecRes);
 	P->Set("Depth",         depthRes);
+	P->Set("Jitter.Offset.X", 0.0f);
+	P->Set("Jitter.Offset.Y", 0.0f);
+	P->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, 0.0f);
+	P->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, 0.0f);
 	P->Set("MV.Scale.X",    settings.mvScaleX);
 	P->Set("MV.Scale.Y",    settings.mvScaleY);
 	P->Set("Depth.Inverted",settings.depthInverted);
@@ -646,11 +612,7 @@ void NeuralNR::OnPresent()
 	{
 		static NVSDK_NGX_Result s_lastLoggedFailure = static_cast<NVSDK_NGX_Result>(-1);
 		static uint32_t s_failureLogFrameCounter = 0;
-		constexpr uint32_t kFailureLogIntervalFrames = 300; 
-
-		const bool isNewFailureCode = (evalRes != s_lastLoggedFailure);
-		++s_failureLogFrameCounter;
-		if (isNewFailureCode || s_failureLogFrameCounter >= kFailureLogIntervalFrames)
+		if (evalRes != s_lastLoggedFailure || ++s_failureLogFrameCounter >= 300)
 		{
 			logger::warn("NeuralNR: EvaluateFeature failed, res=0x{:X}", static_cast<uint32_t>(evalRes));
 			s_lastLoggedFailure = evalRes;
@@ -693,30 +655,21 @@ void NeuralNR::PostPostLoad()
 	featureInfo.PathListInfo.Path = searchPaths;
 	featureInfo.PathListInfo.Length = 1;
 
-	// Layer 1: Core Init uses confirmed plain Init signature (AppId, Path, Device, FeatureCommonInfo, Version)
 	if (s.pfnInitExt)
 	{
 		NVSDK_NGX_Result initRes = ((PFN_InitExt_Std)s.pfnInitExt)(
-			231313132ULL, 
-			appPath.c_str(), 
-			globals::d3d::device, 
-			&featureInfo,
-			NVSDK_NGX_Version_API
+			231313132ULL, appPath.c_str(), globals::d3d::device, &featureInfo, NVSDK_NGX_Version_API
 		);
 
 		if (!NVSDK_NGX_SUCCEED(initRes))
-		{ 
-			logger::warn("NeuralNR: Core Init failed with result code: 0x{:X}. Proceeding to allocate parameters via Streamline context...", static_cast<uint32_t>(initRes)); 
-		}
+			logger::warn("NeuralNR: Core Init failed. Proceeding to allocate parameters via Streamline context..."); 
 	}
 
-	if (!s.pfnGetCapabilityParameters)
-	{ logger::info("NeuralNR: GetCapabilityParameters export missing from core"); return; }
+	if (!s.pfnGetCapabilityParameters) return;
 
 	NVSDK_NGX_Result capRes = ((PFN_GetCapParams)s.pfnGetCapabilityParameters)(&s.nrParams);
 
-	if (!NVSDK_NGX_SUCCEED(capRes) || !s.nrParams)
-	{ logger::info("NeuralNR: GetCapabilityParameters failed"); return; }
+	if (!NVSDK_NGX_SUCCEED(capRes) || !s.nrParams) return;
 
 	logger::info("NeuralNR: Core context acquired. Snippet initialization deferred to active render cycle.");
 }
@@ -726,7 +679,6 @@ void NeuralNR::Reset() { GetState().needsReset = true; }
 void NeuralNR::DrawSettings()
 {
 	ImGui::Checkbox("Enable DLSS Neural NR", &settings.enabled);
-
 	if (settings.enabled)
 	{
 		ImGui::Separator();
