@@ -480,7 +480,7 @@ void NeuralNR::PostPostLoad()
 	void* pfnSnippetInit = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_Init");
 
 	CSS::CallerSpoof::Install();
-	NVSDK_NGX_Result snipInitRes = 0xBAD00007; 
+	NVSDK_NGX_Result snipInitRes = static_cast<NVSDK_NGX_Result>(0xBAD00007); 
 
 	if (pfnSnippetInitExt)
 	{
