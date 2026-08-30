@@ -66,17 +66,14 @@ void NeuralNR::LoadDLL()
 		return;
 	}
 
-	// 1. Get the capability block retriever from the Core
 	s.pfnInitExt                 = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_Init");
 	s.pfnGetCapabilityParameters = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_GetCapabilityParameters");
 
-	// 2. Bypass the Core's blacklist by loading the Snippet directly
 	std::wstring snippetPath = Util::PathHelpers::GetShadersPath() / L"Upscaling" / L"Streamline" / L"nvngx_dlssnr.dll";
 	s.hSnippetDLL = LoadLibraryW(snippetPath.c_str());
 
 	if (s.hSnippetDLL)
 	{
-		// 3. Extract the feature functions directly from the snippet
 		s.pfnPopulateParams   = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_PopulateParameters_Impl");
 		s.pfnCreateFeature    = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_CreateFeature");
 		s.pfnEvaluateFeature  = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
@@ -263,8 +260,6 @@ void NeuralNR::ReleaseResources()
 void NeuralNR::ReleaseFeature()
 {
 	auto& s = GetState();
-	
-	// FIX: Do NOT destroy the capability parameter block, the NGX core owns it.
 	if (s.pfnReleaseFeature && s.nrFeature)
 		((PFN_ReleaseFeature)s.pfnReleaseFeature)(s.nrFeature);
 		
@@ -329,8 +324,16 @@ void NeuralNR::OnPresent()
 
 	auto* P = s.nrParams;
 
+	// FIX: Use the specific DLSSNR namespace for creation parameters.
+	// Bypassing this causes the snippet to read 0x0 size and return 0xBAD00007.
+	P->Set("DLSSNR.Width",  (int)w);
+	P->Set("DLSSNR.Height", (int)h);
+	
+	// Set standard block variables as a fallback for the NGX core interposer
 	P->Set(NVSDK_NGX_Parameter_Width,  (int)w);
 	P->Set(NVSDK_NGX_Parameter_Height, (int)h);
+	P->Set(NVSDK_NGX_Parameter_OutWidth,  (int)w);
+	P->Set(NVSDK_NGX_Parameter_OutHeight, (int)h);
 	
 	auto SetSubrect = [&](const char* name) {
 		P->Set((std::string(name) + "SubrectBaseX").c_str(), 0);
@@ -468,7 +471,6 @@ void NeuralNR::PostPostLoad()
 	if (!s.pfnGetCapabilityParameters)
 	{ logger::info("NeuralNR: GetCapabilityParameters export missing from core"); return; }
 
-	// FIX: Grab the core's capability block, DO NOT allocate a blank one!
 	NVSDK_NGX_Result capRes = ((PFN_GetCapParams)s.pfnGetCapabilityParameters)(&s.nrParams);
 
 	if (!NVSDK_NGX_SUCCEED(capRes) || !s.nrParams)
