@@ -26,46 +26,53 @@ namespace CSS::CallerSpoof
 	static slIsFeatureSupported_t s_orig_slIsFeatureSupported = nullptr;
 	static std::vector<slFeature> s_modifiedFeatures;
 
-	using PFN_EvaluateFeature = NVSDK_NGX_Result (*)(ID3D11DeviceContext*, NVSDK_NGX_Handle*, NVSDK_NGX_Parameter*, void*);
-	static PFN_EvaluateFeature s_orig_NGXEvaluate = nullptr;
+	using PFN_CreateFeature = NVSDK_NGX_Result (*)(ID3D11DeviceContext*, NVSDK_NGX_Feature, NVSDK_NGX_Parameter*, NVSDK_NGX_Handle**);
+	static PFN_CreateFeature s_orig_NGXCreate = nullptr;
 
-	using GetProcAddress_t = FARPROC(WINAPI*)(HMODULE, LPCSTR);
-	static GetProcAddress_t s_origGetProcAddress = nullptr;
+	using GetModuleFileNameW_t = DWORD(WINAPI*)(HMODULE, LPWSTR, DWORD);
+	static GetModuleFileNameW_t s_origK32 = nullptr;
+	static HMODULE s_ourModule = nullptr;
 
-	static NVSDK_NGX_Result Hooked_NGXEvaluate(ID3D11DeviceContext* ctx, NVSDK_NGX_Handle* feat, NVSDK_NGX_Parameter* param, void* info)
+	// --- The Direct Caller Spoof (Section 2) ---
+	static DWORD WINAPI HookedK32(HMODULE hModule, LPWSTR lpFilename, DWORD nSize)
+	{
+		if (hModule == s_ourModule && lpFilename && nSize > 0)
+		{
+			const wchar_t* spoof = L"C:\\Windows\\System32\\nvngx.dll";
+			const DWORD len = static_cast<DWORD>(wcslen(spoof));
+			if (len >= nSize)
+			{
+				wcsncpy_s(lpFilename, nSize, spoof, _TRUNCATE);
+				SetLastError(ERROR_INSUFFICIENT_BUFFER);
+				return nSize;
+			}
+			wcscpy_s(lpFilename, nSize, spoof);
+			SetLastError(ERROR_SUCCESS);
+			return len;
+		}
+
+		if (s_origK32) return s_origK32(hModule, lpFilename, nSize);
+		return 0;
+	}
+
+	// --- The Context Steal (Section 2) ---
+	static NVSDK_NGX_Result Hooked_NGXCreate(ID3D11DeviceContext* ctx, NVSDK_NGX_Feature feat, NVSDK_NGX_Parameter* param, NVSDK_NGX_Handle** handle)
 	{
 		auto& s = NeuralNR::GetState();
 		
-		// Steal ONLY the parameter block, NOT the handle (which belongs to DLSS-SR).
+		// When Streamline creates DLSS-SR, we steal the globally authorized parameter block
 		if (!s.streamlineContextCaptured && param)
 		{
-			logger::info("NeuralNR [Streamline]: DLSS pipeline intercepted! Stealing globally validated NGX_Parameter block.");
+			logger::info("NeuralNR [Streamline]: Intercepted NGX_CreateFeature! Stealing globally validated NGX_Parameter block.");
 			s.nrParams = param;
 			s.streamlineContextCaptured = true;
 		}
 
-		if (s_orig_NGXEvaluate) {
-			return s_orig_NGXEvaluate(ctx, feat, param, info);
-		}
-		return NVSDK_NGX_Result_Fail;
+		if (s_orig_NGXCreate) return s_orig_NGXCreate(ctx, feat, param, handle);
+		return static_cast<NVSDK_NGX_Result>(0xBAD00007);
 	}
 
-	static FARPROC WINAPI Hooked_GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
-	{
-		// Intercept NGX function resolution dynamically to bypass IAT evasion
-		if (lpProcName && ((ULONG_PTR)lpProcName > 0xFFFF) && _stricmp(lpProcName, "NVSDK_NGX_D3D11_EvaluateFeature") == 0)
-		{
-			if (!s_orig_NGXEvaluate) {
-				s_orig_NGXEvaluate = (PFN_EvaluateFeature)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
-			}
-			return (FARPROC)Hooked_NGXEvaluate;
-		}
-
-		// Pass through everything else
-		if (s_origGetProcAddress) return s_origGetProcAddress(hModule, lpProcName);
-		return ::GetProcAddress(hModule, lpProcName);
-	}
-
+	// --- The Plugin Array Injection (Section 2) ---
 	int Hooked_slInit(const slPreferences* pref, void* app, void* device)
 	{
 		logger::info("NeuralNR [Streamline]: Intercepted slInit. Modifying plugin array...");
@@ -140,33 +147,7 @@ namespace CSS::CallerSpoof
 		}
 	}
 
-	bool TryHookNGX()
-	{
-		static bool s_hooksInstalled = false;
-		if (s_hooksInstalled) return true;
-
-		HMODULE hDLSS = GetModuleHandleW(L"sl.dlss.dll");
-		HMODULE hInterposer = GetModuleHandleW(L"sl.interposer.dll");
-		
-		if (hDLSS || hInterposer)
-		{
-			if (hDLSS) {
-				PatchModuleIATAny(hDLSS, "NVSDK_NGX_D3D11_EvaluateFeature", (void*)Hooked_NGXEvaluate, (void**)&s_orig_NGXEvaluate);
-				PatchModuleIATAny(hDLSS, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
-			}
-			if (hInterposer) {
-				PatchModuleIATAny(hInterposer, "NVSDK_NGX_D3D11_EvaluateFeature", (void*)Hooked_NGXEvaluate, (void**)&s_orig_NGXEvaluate);
-				PatchModuleIATAny(hInterposer, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
-			}
-			
-			logger::info("NeuralNR [Streamline]: NGX dynamic resolution hooks successfully injected.");
-			s_hooksInstalled = true;
-			return true;
-		}
-		return false;
-	}
-
-	void InstallStreamlineHooks()
+	void InstallUpscalerHooks()
 	{
 		HMODULE hUpscaler = GetModuleHandleW(L"SkyrimUpscaler.dll"); 
 		if (!hUpscaler) hUpscaler = GetModuleHandleW(L"FSR2.dll");
@@ -176,6 +157,29 @@ namespace CSS::CallerSpoof
 		PatchModuleIATAny(hUpscaler, "slIsFeatureSupported", (void*)Hooked_slIsFeatureSupported, (void**)&s_orig_slIsFeatureSupported);
 	}
 
-	void Install() {}
+	void InstallInterposerHooks(HMODULE hInterposer)
+	{
+		if (hInterposer) {
+			PatchModuleIATAny(hInterposer, "NVSDK_NGX_D3D11_CreateFeature", (void*)Hooked_NGXCreate, (void**)&s_orig_NGXCreate);
+			logger::info("NeuralNR: Streamline Interposer hooked successfully. Waiting for DLSS-SR creation to steal parameters.");
+		}
+	}
+
+	void Install()
+	{
+		GetModuleHandleExW(
+			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCWSTR>(&Install),
+			&s_ourModule);
+
+		HMODULE hCore = GetModuleHandleW(L"_nvngx.dll");
+		HMODULE hNGX  = GetModuleHandleW(L"nvngx.dll");
+		HMODULE hNR = GetModuleHandleW(L"nvngx_dlssnr.dll");
+
+		if (hCore) PatchModuleIATAny(hCore, "GetModuleFileNameW", (void*)HookedK32, (void**)&s_origK32);
+		if (hNGX)  PatchModuleIATAny(hNGX,  "GetModuleFileNameW", (void*)HookedK32, (void**)&s_origK32);
+		if (hNR)   PatchModuleIATAny(hNR,   "GetModuleFileNameW", (void*)HookedK32, (void**)&s_origK32);
+	}
+
 	void Uninstall() {}
 }

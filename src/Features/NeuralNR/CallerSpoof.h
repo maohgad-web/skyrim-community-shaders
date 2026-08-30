@@ -1,9 +1,12 @@
 #pragma once
 
+#include <windows.h>
+
 namespace CSS::CallerSpoof
 {
 	void Install();
 	void Uninstall();
-	void InstallStreamlineHooks();
-	bool TryHookNGX(); // Dynamically probes Streamline
+	
+	void InstallUpscalerHooks();
+	void InstallInterposerHooks(HMODULE hInterposer);
 }

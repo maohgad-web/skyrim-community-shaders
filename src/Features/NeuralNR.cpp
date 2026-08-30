@@ -86,9 +86,11 @@ bool NeuralNR::CreateFeature()
 	auto& s = GetState();
 	if (!s.pfnCreateFeature || !s.nrParams) return false;
 
-	// Execute feature creation directly against the target snippet DLL
+	// Execute feature creation directly against the target snippet DLL (Section 2)
+	CSS::CallerSpoof::Install();
 	NVSDK_NGX_Result res = ((PFN_CreateFeature)s.pfnCreateFeature)(
 		globals::d3d::context, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), s.nrParams, &s.nrFeature);
+	CSS::CallerSpoof::Uninstall();
 
 	if (!NVSDK_NGX_SUCCEED(res) || !s.nrFeature)
 	{
@@ -226,14 +228,25 @@ void NeuralNR::OnPresent()
 
 	auto& s = GetState();
 
-	// 1. Await Streamline Context (Dynamic polling)
-	if (!s.streamlineContextCaptured || !s.nrParams || !s.pfnEvaluateFeature || !s.pfnCreateFeature) 
+	// 1. Install Dynamic Interposer Hooks when Streamline initializes
+	if (!s.streamlineHooksInstalled) {
+		HMODULE hInterposer = GetModuleHandleW(L"sl.interposer.dll");
+		if (!hInterposer) hInterposer = GetModuleHandleW(L"sl.dlss.dll");
+
+		if (hInterposer) {
+			CSS::CallerSpoof::InstallInterposerHooks(hInterposer);
+			s.streamlineHooksInstalled = true;
+		} else {
+			return; // Wait for Streamline
+		}
+	}
+
+	// 2. Wait for Streamline Context
+	if (!s.streamlineContextCaptured || !s.nrParams || !s.pfnEvaluateFeature) 
 	{
 		static uint32_t s_waitCounter = 0;
-		CSS::CallerSpoof::TryHookNGX();
-
 		if (++s_waitCounter % 300 == 1)
-			logger::info("NeuralNR: Passively waiting for Streamline to evaluate DLSS and expose the NGX parameter block...");
+			logger::info("NeuralNR: Passively waiting for Streamline to create DLSS-SR and expose the NGX parameter block...");
 		return; 
 	}
 
@@ -245,17 +258,17 @@ void NeuralNR::OnPresent()
 	if (s.w != w || s.h != h) s.needsReset = true;
 	CreateResources(w, h, dsc.Format);
 
-	// 2. Await 3D Scene
+	// 3. Await 3D Scene
 	if (!s.mvSRV || !s.depthSRV) 
 	{
 		static uint32_t s_resourceWaitCounter = 0;
 		if (++s_resourceWaitCounter % 300 == 1)
-			logger::info("NeuralNR: Streamline context captured! Waiting for active 3D scene (Depth/MVec)...");
+			logger::info("NeuralNR: Streamline context stolen! Waiting for active 3D scene (Depth/MVec)...");
 		back->Release(); 
 		return; 
 	}
 
-	// 3. Manual Snippet Feature Creation (Leveraging Stolen Parameters)
+	// 4. Manual Snippet Feature Creation (Leveraging Stolen Parameters)
 	if (!s.nrFeature) {
 		static uint32_t s_createRetry = 0;
 		if (s_createRetry++ % 60 == 0) {
@@ -273,6 +286,7 @@ void NeuralNR::OnPresent()
 
 	auto* P = s.nrParams;
 	
+	// Parameters MUST be passed as unsigned int for dimensions/booleans[cite: 9]
 	P->Set("DLSSNR.Width",  static_cast<unsigned int>(w));
 	P->Set("DLSSNR.Height", static_cast<unsigned int>(h));
 	P->Set(NVSDK_NGX_Parameter_Width,  static_cast<unsigned int>(w));
@@ -336,9 +350,11 @@ void NeuralNR::OnPresent()
 	P->Set("MV.Scale.Y",    settings.mvScaleY);
 	P->Set("Depth.Inverted",static_cast<unsigned int>(settings.depthInverted));
 
-	// 4. Feature Execution via Snippet Pipeline
+	// 5. Feature Execution via Snippet Pipeline
+	CSS::CallerSpoof::Install();
 	NVSDK_NGX_Result evalRes = ((PFN_EvaluateFeature)s.pfnEvaluateFeature)(
 		ctx, s.nrFeature, P, nullptr);
+	CSS::CallerSpoof::Uninstall();
 
 	static bool s_loggedEval = false;
 	if (NVSDK_NGX_SUCCEED(evalRes) && !s_loggedEval)
@@ -385,7 +401,8 @@ void NeuralNR::PostPostLoad()
 		return;
 	}
 
-	CSS::CallerSpoof::InstallStreamlineHooks();
+	// Install the slInit hook immediately at boot so Streamline authorizes Feature 1004 internally
+	CSS::CallerSpoof::InstallUpscalerHooks();
 }
 
 void NeuralNR::Reset() { GetState().needsReset = true; }

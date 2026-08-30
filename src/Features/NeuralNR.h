@@ -26,6 +26,8 @@ struct NeuralNR : public Feature
     struct State
     {
         std::atomic<bool> needsReset{true};
+        
+        bool streamlineHooksInstalled = false;
         bool streamlineContextCaptured = false; 
         
         HMODULE hSnippetDLL = nullptr;
