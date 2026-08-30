@@ -324,12 +324,9 @@ void NeuralNR::OnPresent()
 
 	auto* P = s.nrParams;
 
-	// FIX: Use the specific DLSSNR namespace for creation parameters.
-	// Bypassing this causes the snippet to read 0x0 size and return 0xBAD00007.
 	P->Set("DLSSNR.Width",  (int)w);
 	P->Set("DLSSNR.Height", (int)h);
 	
-	// Set standard block variables as a fallback for the NGX core interposer
 	P->Set(NVSDK_NGX_Parameter_Width,  (int)w);
 	P->Set(NVSDK_NGX_Parameter_Height, (int)h);
 	P->Set(NVSDK_NGX_Parameter_OutWidth,  (int)w);
@@ -455,6 +452,7 @@ void NeuralNR::PostPostLoad()
 	featureInfo.PathListInfo.Path = searchPaths;
 	featureInfo.PathListInfo.Length = 1;
 
+	// 1. Initialize the Core
 	NVSDK_NGX_Result initRes = ((PFN_InitExt)s.pfnInitExt)(
 		231313132ULL, 
 		appPath.c_str(), 
@@ -468,6 +466,7 @@ void NeuralNR::PostPostLoad()
 		logger::warn("NeuralNR: Init_Ext failed with result code: 0x{:X}. Proceeding to allocate parameters via Streamline context...", static_cast<uint32_t>(initRes)); 
 	}
 
+	// 2. Get the capability block from the Core
 	if (!s.pfnGetCapabilityParameters)
 	{ logger::info("NeuralNR: GetCapabilityParameters export missing from core"); return; }
 
@@ -476,6 +475,39 @@ void NeuralNR::PostPostLoad()
 	if (!NVSDK_NGX_SUCCEED(capRes) || !s.nrParams)
 	{ logger::info("NeuralNR: GetCapabilityParameters failed"); return; }
 	
+	// 3. Initialize the Snippet directly (CRITICAL FIX)
+	void* pfnSnippetInitExt = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_Init_Ext");
+	void* pfnSnippetInit = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_Init");
+
+	CSS::CallerSpoof::Install();
+	NVSDK_NGX_Result snipInitRes = 0xBAD00007; 
+
+	if (pfnSnippetInitExt)
+	{
+		// The snippet build replaces FeatureCommonInfo* with Parameter*
+		using PFN_SnipInitExt = NVSDK_NGX_Result (*)(unsigned long long, const wchar_t*, ID3D11Device*, NVSDK_NGX_Version, NVSDK_NGX_Parameter*);
+		snipInitRes = ((PFN_SnipInitExt)pfnSnippetInitExt)(
+			231313132ULL, appPath.c_str(), globals::d3d::device, NVSDK_NGX_Version_API, s.nrParams);
+	}
+	else if (pfnSnippetInit)
+	{
+		// Fallback for standard signature
+		using PFN_SnipInit = NVSDK_NGX_Result (*)(unsigned long long, const wchar_t*, ID3D11Device*, const NVSDK_NGX_FeatureCommonInfo*, NVSDK_NGX_Version);
+		snipInitRes = ((PFN_SnipInit)pfnSnippetInit)(
+			231313132ULL, appPath.c_str(), globals::d3d::device, &featureInfo, NVSDK_NGX_Version_API);
+	}
+	CSS::CallerSpoof::Uninstall();
+
+	if (!NVSDK_NGX_SUCCEED(snipInitRes))
+	{
+		logger::warn("NeuralNR: Snippet Init failed with res=0x{:X}", static_cast<uint32_t>(snipInitRes));
+	}
+	else
+	{
+		logger::info("NeuralNR: Snippet successfully initialized.");
+	}
+
+	// 4. Let the snippet wire its internal callbacks into the parameter block
 	if (s.pfnPopulateParams)
 	{
 		using PFN_Populate = NVSDK_NGX_Result (*)(NVSDK_NGX_Parameter*);
