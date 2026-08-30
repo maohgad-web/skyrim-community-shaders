@@ -57,17 +57,32 @@ void NeuralNR::LoadDLL()
 {
 	auto& s = GetState();
 
-	s.hDLL = LoadLibraryW(L"nvngx.dll");
+	// PATCH: check for an ALREADY-loaded core first via GetModuleHandleW.
+	// Streamline/Upscaling loads the real core using NVIDIA's own driver-
+	// store discovery — it lives nested under
+	// DriverStore\FileRepository\<package>\, not on Windows' standard DLL
+	// search path, so a bare LoadLibraryW(L"_nvngx.dll") can't find it.
+	// LoadLibraryW is kept as a last-resort fallback (costs nothing to try,
+	// even though it will likely fail for the same reason).
+	s.hDLL = GetModuleHandleW(L"_nvngx.dll");
+	if (!s.hDLL) s.hDLL = GetModuleHandleW(L"nvngx.dll");
+	if (!s.hDLL) s.hDLL = LoadLibraryW(L"nvngx.dll");
 	if (!s.hDLL) s.hDLL = LoadLibraryW(L"_nvngx.dll");
 
 	if (!s.hDLL)
 	{
-		logger::warn("NeuralNR: Could not find the core NGX library (nvngx.dll or _nvngx.dll).");
-		return;
+		logger::warn("NeuralNR: Could not find the core NGX library (nvngx.dll or _nvngx.dll) — Streamline/DLSS may not have initialized it yet.");
+		// PATCH: don't return here. The snippet DLL below uses a full known
+		// path and doesn't depend on the core being found at this exact
+		// moment — no reason to block it on an unrelated failure. Callers
+		// retry LoadDLL() later (see OnPresent), so the core will be
+		// re-checked on a subsequent attempt without reloading the snippet.
 	}
-
-	s.pfnInitExt                 = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_Init");
-	s.pfnGetCapabilityParameters = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_GetCapabilityParameters");
+	else
+	{
+		s.pfnInitExt                 = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_Init");
+		s.pfnGetCapabilityParameters = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_GetCapabilityParameters");
+	}
 
 	std::wstring snippetPath = Util::PathHelpers::GetShadersPath() / L"Upscaling" / L"Streamline" / L"nvngx_dlssnr.dll";
 	s.hSnippetDLL = LoadLibraryW(snippetPath.c_str());
@@ -300,17 +315,34 @@ void NeuralNR::OnPresent()
 	auto& s = GetState();
 	if (!s.initialized)
 	{
-		static bool s_setupAttempted = false;
-		if (!s_setupAttempted)
+		// PATCH: was a permanent one-shot (static bool, set once forever) —
+		// it ran on the very first rendered frame, almost certainly before
+		// Streamline had loaded the real NGX core for its own DLSS SR/FG
+		// use, and a failure there meant it could never succeed later even
+		// once the core did become available. Now retries periodically
+		// (not every frame, to avoid hammering LoadLibrary/GetProcAddress
+		// needlessly) until it succeeds, up to a generous attempt cap.
+		static uint32_t s_retryFrameCounter = 0;
+		static uint32_t s_setupAttempts = 0;
+		constexpr uint32_t kSetupRetryIntervalFrames = 120; // ~2s at 60fps
+		constexpr uint32_t kMaxSetupAttempts = 300;         // ~10 minutes of retrying
+
+		const bool firstAttempt = (s_setupAttempts == 0);
+		const bool dueForRetry  = (++s_retryFrameCounter >= kSetupRetryIntervalFrames) && (s_setupAttempts < kMaxSetupAttempts);
+		if (firstAttempt || dueForRetry)
 		{
-			s_setupAttempted = true;
+			s_retryFrameCounter = 0;
+			++s_setupAttempts;
 			PostPostLoad();
 		}
 	}
 
 	if (!s.pfnEvaluateFeature || !s.nrParams) 
 	{
-		settings.enabled = false;
+		// PATCH: no longer force settings.enabled = false here — that
+		// overrode the user's own checkbox and masked the fact that setup
+		// was never actually being retried. Just wait quietly for the core
+		// library to become available and try again on a later frame.
 		return;
 	}
 
@@ -324,9 +356,12 @@ void NeuralNR::OnPresent()
 
 	auto* P = s.nrParams;
 
+	// FIX: Use the specific DLSSNR namespace for creation parameters.
+	// Bypassing this causes the snippet to read 0x0 size and return 0xBAD00007.
 	P->Set("DLSSNR.Width",  (int)w);
 	P->Set("DLSSNR.Height", (int)h);
 	
+	// Set standard block variables as a fallback for the NGX core interposer
 	P->Set(NVSDK_NGX_Parameter_Width,  (int)w);
 	P->Set(NVSDK_NGX_Parameter_Height, (int)h);
 	P->Set(NVSDK_NGX_Parameter_OutWidth,  (int)w);
@@ -452,7 +487,6 @@ void NeuralNR::PostPostLoad()
 	featureInfo.PathListInfo.Path = searchPaths;
 	featureInfo.PathListInfo.Length = 1;
 
-	// 1. Initialize the Core
 	NVSDK_NGX_Result initRes = ((PFN_InitExt)s.pfnInitExt)(
 		231313132ULL, 
 		appPath.c_str(), 
@@ -466,7 +500,6 @@ void NeuralNR::PostPostLoad()
 		logger::warn("NeuralNR: Init_Ext failed with result code: 0x{:X}. Proceeding to allocate parameters via Streamline context...", static_cast<uint32_t>(initRes)); 
 	}
 
-	// 2. Get the capability block from the Core
 	if (!s.pfnGetCapabilityParameters)
 	{ logger::info("NeuralNR: GetCapabilityParameters export missing from core"); return; }
 
@@ -475,39 +508,6 @@ void NeuralNR::PostPostLoad()
 	if (!NVSDK_NGX_SUCCEED(capRes) || !s.nrParams)
 	{ logger::info("NeuralNR: GetCapabilityParameters failed"); return; }
 	
-	// 3. Initialize the Snippet directly (CRITICAL FIX)
-	void* pfnSnippetInitExt = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_Init_Ext");
-	void* pfnSnippetInit = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_Init");
-
-	CSS::CallerSpoof::Install();
-	NVSDK_NGX_Result snipInitRes = static_cast<NVSDK_NGX_Result>(0xBAD00007); 
-
-	if (pfnSnippetInitExt)
-	{
-		// The snippet build replaces FeatureCommonInfo* with Parameter*
-		using PFN_SnipInitExt = NVSDK_NGX_Result (*)(unsigned long long, const wchar_t*, ID3D11Device*, NVSDK_NGX_Version, NVSDK_NGX_Parameter*);
-		snipInitRes = ((PFN_SnipInitExt)pfnSnippetInitExt)(
-			231313132ULL, appPath.c_str(), globals::d3d::device, NVSDK_NGX_Version_API, s.nrParams);
-	}
-	else if (pfnSnippetInit)
-	{
-		// Fallback for standard signature
-		using PFN_SnipInit = NVSDK_NGX_Result (*)(unsigned long long, const wchar_t*, ID3D11Device*, const NVSDK_NGX_FeatureCommonInfo*, NVSDK_NGX_Version);
-		snipInitRes = ((PFN_SnipInit)pfnSnippetInit)(
-			231313132ULL, appPath.c_str(), globals::d3d::device, &featureInfo, NVSDK_NGX_Version_API);
-	}
-	CSS::CallerSpoof::Uninstall();
-
-	if (!NVSDK_NGX_SUCCEED(snipInitRes))
-	{
-		logger::warn("NeuralNR: Snippet Init failed with res=0x{:X}", static_cast<uint32_t>(snipInitRes));
-	}
-	else
-	{
-		logger::info("NeuralNR: Snippet successfully initialized.");
-	}
-
-	// 4. Let the snippet wire its internal callbacks into the parameter block
 	if (s.pfnPopulateParams)
 	{
 		using PFN_Populate = NVSDK_NGX_Result (*)(NVSDK_NGX_Parameter*);
