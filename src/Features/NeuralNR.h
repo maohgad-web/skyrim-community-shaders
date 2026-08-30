@@ -23,34 +23,18 @@ struct NeuralNR : public Feature
     void OnPresent();
     bool IsEnabled() { return settings.enabled; }
 
-private:
-    struct Settings
-    {
-        bool  enabled = true;
-        float intensity = 1.0f, style = 0.0f;
-        float localTone = 0.5f, localStructure = 0.5f, skinStructure = 0.5f;
-        int   useAutoMask = 1, depthInverted = 0, preset = 0;
-        float mvScaleX = 1.0f, mvScaleY = 1.0f;
-        float paperWhiteNits = 203.0f, encodeStrength = 1.0f;
-    } settings;
-
     struct State
     {
-        bool initialized = false;
         std::atomic<bool> needsReset{true};
+        bool streamlineContextCaptured = false; 
         
-        HMODULE hDLL = nullptr;
-        HMODULE hSnippetDLL = nullptr; // Bypasses core nvngx.dll
+        HMODULE hSnippetDLL = nullptr;
         
         NVSDK_NGX_Handle* nrFeature = nullptr;
         NVSDK_NGX_Parameter* nrParams = nullptr;
         
-        void* pfnInitExt = nullptr;
-        void* pfnGetCapabilityParameters = nullptr; // Gets core block instead of allocating a blank one
-        void* pfnPopulateParams = nullptr; // Forces snippet to configure parameters
         void* pfnCreateFeature = nullptr;
         void* pfnEvaluateFeature = nullptr;
-        void* pfnReleaseFeature = nullptr; 
 
         ID3D11Texture2D* inputColor = nullptr;
         ID3D11Texture2D* sdrProxyTex = nullptr;
@@ -74,13 +58,21 @@ private:
 
     static State& GetState() { static State s; return s; }
 
-    void LoadDLL();
-    bool CheckGate();
+private:
+    struct Settings
+    {
+        bool  enabled = true;
+        float intensity = 1.0f, style = 0.0f;
+        float localTone = 0.5f, localStructure = 0.5f, skinStructure = 0.5f;
+        int   useAutoMask = 1, depthInverted = 0, preset = 0;
+        float mvScaleX = 1.0f, mvScaleY = 1.0f;
+        float paperWhiteNits = 203.0f, encodeStrength = 1.0f;
+    } settings;
+
     bool CreateFeature();
     bool CompileShaders();
     void CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt);
     void ReleaseResources();
-    void ReleaseFeature();
     void DispatchProxy();
     void DispatchTransfer();
     ID3D11Resource* ResourceFromView(ID3D11View* view) const;
