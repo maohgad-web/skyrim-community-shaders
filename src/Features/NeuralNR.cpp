@@ -160,10 +160,8 @@ void NeuralNR::LoadDLL()
 
 	if (s.hSnippetDLL)
 	{
-		s.pfnPopulateParams   = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_PopulateParameters_Impl");
-		s.pfnCreateFeature    = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_CreateFeature");
-		s.pfnEvaluateFeature  = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
-		s.pfnReleaseFeature   = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_ReleaseFeature");
+		s.pfnPopulateParams = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_PopulateParameters_Impl");
+		// Create, Evaluate, and Release are resolved dynamically in CreateFeature based on Core Routing success
 	}
 	else
 	{
@@ -233,20 +231,53 @@ bool NeuralNR::CompileShaders()
 bool NeuralNR::CreateFeature()
 {
 	auto& s = GetState();
-	if (!s.pfnCreateFeature || !s.nrParams) return false;
+	if (!s.nrParams) return false;
+
+	// CRITICAL FIX: Dynamic Core Routing
+	// Fetching Create pointers from both modules to bypass FAIL_NotInitialized (0xBAD00007).
+	auto pfnCoreCreate    = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_CreateFeature");
+	auto pfnSnippetCreate = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_CreateFeature");
 
 	CSS::CallerSpoof::Install();
 	
-	NVSDK_NGX_Result res = ((PFN_CreateFeature)s.pfnCreateFeature)(
-		globals::d3d::context, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), s.nrParams, &s.nrFeature);
+	NVSDK_NGX_Result res = static_cast<NVSDK_NGX_Result>(0xBAD00007);
+
+	// Try the Core _nvngx.dll first. Streamline already initialized it.
+	if (pfnCoreCreate) {
+		logger::info("NeuralNR: Attempting CreateFeature via Core NGX Subsystem...");
+		res = ((PFN_CreateFeature)pfnCoreCreate)(
+			globals::d3d::context, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), s.nrParams, &s.nrFeature);
+		
+		if (NVSDK_NGX_SUCCEED(res) && s.nrFeature) {
+			logger::info("NeuralNR: Core accepted Feature creation! Binding Evaluate directly to Core.");
+			s.pfnEvaluateFeature = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
+			s.pfnReleaseFeature  = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_ReleaseFeature");
+		}
+	}
+
+	// Fallback to Snippet directly if Core rejects the ID
+	if (!NVSDK_NGX_SUCCEED(res) || !s.nrFeature) {
+		logger::warn("NeuralNR: Core CreateFeature failed (0x{:X}). Attempting direct Snippet creation...", static_cast<uint32_t>(res));
+		if (pfnSnippetCreate) {
+			res = ((PFN_CreateFeature)pfnSnippetCreate)(
+				globals::d3d::context, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), s.nrParams, &s.nrFeature);
+				
+			if (NVSDK_NGX_SUCCEED(res) && s.nrFeature) {
+				logger::info("NeuralNR: Snippet accepted Feature creation! Binding Evaluate directly to Snippet.");
+				s.pfnEvaluateFeature = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
+				s.pfnReleaseFeature  = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_ReleaseFeature");
+			}
+		}
+	}
 		
 	CSS::CallerSpoof::Uninstall();
 
 	if (!NVSDK_NGX_SUCCEED(res) || !s.nrFeature)
 	{
-		logger::error("NeuralNR: CreateFeature failed, res=0x{:X}", static_cast<uint32_t>(res));
+		logger::error("NeuralNR: CreateFeature failed completely across all modules, res=0x{:X}", static_cast<uint32_t>(res));
 		return false;
 	}
+	
 	logger::info("NeuralNR: CreateFeature Success.");
 	return true;
 }
@@ -387,9 +418,7 @@ void NeuralNR::OnPresent()
 
 	auto& s = GetState();
 
-	// 1. Asynchronous Module Acquisition Loop
-	// Streamline injects core NGX modules dynamically, so we must poll until they appear.
-	if (!s.pfnEvaluateFeature || !s.nrParams) 
+	if (!s.nrParams) 
 	{
 		static uint32_t s_modulePollCounter = 0;
 		static uint32_t s_moduleLoadAttempts = 0;
@@ -416,7 +445,6 @@ void NeuralNR::OnPresent()
 	if (s.w != w || s.h != h) s.needsReset = true;
 	CreateResources(w, h, dsc.Format);
 
-	// Completely block snippet initialization and evaluation until the 3D world is active.
 	if (!s.mvSRV || !s.depthSRV) 
 	{
 		static uint32_t s_resourceWaitCounter = 0;
@@ -549,7 +577,7 @@ void NeuralNR::OnPresent()
 						((PFN_Populate)s.pfnPopulateParams)(s.nrParams);
 					}
 				} else {
-					logger::warn("NeuralNR: Strategy {} Snippet Handshake Failed.", s_strategy);
+					logger::warn("NeuralNR: Strategy {} Snippet Handshake Failed (0x{:X}).", s_strategy, static_cast<uint32_t>(snippetInitRes));
 					s_strategy++;
 					back->Release();
 					return;
@@ -576,7 +604,7 @@ void NeuralNR::OnPresent()
 		}
 	}
 
-	if (!s.nrFeature)
+	if (!s.nrFeature || !s.pfnEvaluateFeature)
 	{
 		back->Release();
 		return;
@@ -660,9 +688,6 @@ void NeuralNR::PostPostLoad()
 {
 	auto& s = GetState();
 	LoadDLL();
-	
-	if (!s.hSnippetDLL || !s.pfnCreateFeature || !s.pfnEvaluateFeature)
-	{ logger::info("NeuralNR: Snippet DLL or required exports not found — disabled"); return; }
 	
 	if (!CheckGate())
 	{ logger::info("NeuralNR: gate failed — disabled"); return; }
