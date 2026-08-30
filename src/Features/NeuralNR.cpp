@@ -384,7 +384,6 @@ void NeuralNR::OnPresent()
 			s.initialized = true;
 		} else {
 			logger::error("NeuralNR: Feature creation permanently failed. Disabling to prevent log spam.");
-			settings.enabled = false;
 			back->Release();
 			return;
 		}
