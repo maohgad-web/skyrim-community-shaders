@@ -43,16 +43,23 @@ namespace CSS::CallerSpoof
 	}
 
 	// --- SEH-Guarded Diagnostic Interceptors ---
+	// PATCH: feature ID confirmed via kFeatureDLSSNR (18) rather than assumed
+	// from timing alone — the ID is already present in this call's own
+	// signature (feat), just previously unused for the steal decision.
+	constexpr int kFeatureDLSSNR = 18;
+
 	static NVSDK_NGX_Result Hooked_NGXCreate(ID3D11DeviceContext* ctx, NVSDK_NGX_Feature feat, NVSDK_NGX_Parameter* param, NVSDK_NGX_Handle** handle)
 	{
 		auto& s = NeuralNR::GetState();
-		
+
 		logger::info("NeuralNR [Diag]: Intercepted Streamline CreateFeature! Target FeatureID: {}", static_cast<uint32_t>(feat));
 
-		if (!s.streamlineContextCaptured && param)
+		const bool isNR = (static_cast<int>(feat) == kFeatureDLSSNR);
+
+		if (!s.streamlineContextCaptured && param && isNR)
 		{
 			__try {
-				logger::info("NeuralNR [Diag]: Stealing validated NGX_Parameter block from active CreateFeature event: {}", (void*)param);
+				logger::info("NeuralNR [Diag]: Confirmed Feature 18 (Neural Rendering) — stealing NGX_Parameter block: {}", (void*)param);
 				s.nrParams = param;
 				s.streamlineContextCaptured = true;
 			}
@@ -61,31 +68,55 @@ namespace CSS::CallerSpoof
 			}
 		}
 
+		NVSDK_NGX_Result createRes = static_cast<NVSDK_NGX_Result>(0xBAD00007);
 		if (s_orig_NGXCreate) {
 			__try {
-				return s_orig_NGXCreate(ctx, feat, param, handle);
+				createRes = s_orig_NGXCreate(ctx, feat, param, handle);
 			} __except (EXCEPTION_EXECUTE_HANDLER) {
 				logger::warn("NeuralNR [Diag]: SEH caught crash inside original Streamline CreateFeature!");
 				return static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
 			}
 		}
-		return static_cast<NVSDK_NGX_Result>(0xBAD00007);
+
+		// PATCH: record the real handle NGX returned specifically for feature
+		// 18, so Hooked_NGXEvaluate — which never receives a feature ID, only
+		// an opaque handle — can confirm by exact pointer match instead of
+		// guessing which evaluate call belongs to NR.
+		if (isNR && handle && *handle)
+		{
+			s.nrFeature = *handle;
+			logger::info("NeuralNR [Diag]: Recorded confirmed NR feature handle: {}", (void*)s.nrFeature);
+		}
+
+		return createRes;
 	}
 
 	static NVSDK_NGX_Result Hooked_NGXEvaluate(ID3D11DeviceContext* ctx, NVSDK_NGX_Handle* feat, NVSDK_NGX_Parameter* param, void* info)
 	{
 		auto& s = NeuralNR::GetState();
-		
+
 		static uint32_t logCounter = 0;
 		if (logCounter++ % 300 == 0) {
 			logger::info("NeuralNR [Diag]: Streamline EvaluateFeature is running mid-game. Handle={}, ParamBlock={}", (void*)feat, (void*)param);
 		}
 
-		if (!s.streamlineContextCaptured && param)
+		// PATCH: EvaluateFeature never receives a feature ID — only this
+		// opaque handle. The only way to know it's genuinely NR is to check
+		// it against the handle Hooked_NGXCreate already confirmed was
+		// returned for feature 18. Without s.nrFeature set yet, there's
+		// nothing trustworthy to steal here — it could be SR's or FG's
+		// handle just as easily. Falls back to the old first-caller-wins
+		// behavior only if Create was never seen at all (e.g. NR's feature
+		// was already created before these hooks installed).
+		const bool isConfirmedNR = s.nrFeature && (feat == s.nrFeature);
+		const bool noCreateSeenYet = !s.nrFeature;
+
+		if (!s.streamlineContextCaptured && param && (isConfirmedNR || noCreateSeenYet))
 		{
 			__try {
-				logger::info("NeuralNR [Diag]: Stealing validated NGX_Parameter block from active EvaluateFeature event: {}", (void*)param);
+				logger::info("NeuralNR [Diag]: Stealing NGX_Parameter block from EvaluateFeature (confirmed={}): {}", isConfirmedNR, (void*)param);
 				s.nrParams = param;
+				if (isConfirmedNR) s.nrFeature = feat;
 				s.streamlineContextCaptured = true;
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
