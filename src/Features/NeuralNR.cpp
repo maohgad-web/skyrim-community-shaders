@@ -86,7 +86,6 @@ bool NeuralNR::CreateFeature()
 	auto& s = GetState();
 	if (!s.pfnCreateFeature || !s.nrParams) return false;
 
-	// Manually execute feature creation directly against the target DLSS-NR snippet DLL utilizing the stolen parameters
 	CSS::CallerSpoof::Install();
 	NVSDK_NGX_Result res = ((PFN_CreateFeature)s.pfnCreateFeature)(
 		globals::d3d::context, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), s.nrParams, &s.nrFeature);
@@ -228,13 +227,15 @@ void NeuralNR::OnPresent()
 
 	auto& s = GetState();
 
-	// 1. Await Parameter Steal from Active DLSS Execution 
-	// (Captured securely by the synchronous hook installed in PostPostLoad)
+	// 1. Dynamic Interceptor Poll: continuously ensures IAT hooks are attached
+	CSS::CallerSpoof::InstallActiveInterceptors();
+
+	// 2. Await parameter capture from active DLSS execution (or after toggling DLSS in menu)
 	if (!s.streamlineContextCaptured || !s.nrParams || !s.pfnEvaluateFeature || !s.pfnCreateFeature) 
 	{
 		static uint32_t s_waitCounter = 0;
 		if (++s_waitCounter % 300 == 1)
-			logger::info("NeuralNR: Waiting for DLSS-SR initialization to capture NGX parameters...");
+			logger::info("NeuralNR: Interceptors active. Waiting for DLSS execution/toggle to capture NGX parameters...");
 		return; 
 	}
 
@@ -246,23 +247,23 @@ void NeuralNR::OnPresent()
 	if (s.w != w || s.h != h) s.needsReset = true;
 	CreateResources(w, h, dsc.Format);
 
-	// 2. 3D Scene Gate to prevent execution during menus/movies
+	// 3. 3D Scene Gate
 	if (!s.mvSRV || !s.depthSRV) 
 	{
 		static uint32_t s_resourceWaitCounter = 0;
 		if (++s_resourceWaitCounter % 300 == 1)
-			logger::info("NeuralNR: Streamline context secured! Waiting for active 3D scene (Depth/MVec)...");
+			logger::info("NeuralNR: Parameter context acquired! Waiting for 3D depth and motion vectors...");
 		back->Release(); 
 		return; 
 	}
 
-	// 3. Manual Snippet Feature Creation using stolen parameters
+	// 4. Feature Creation on DLSS-NR snippet using captured parameters
 	if (!s.nrFeature) {
 		static uint32_t s_createRetry = 0;
 		if (s_createRetry++ % 60 == 0) {
-			logger::info("NeuralNR: Establishing Neural Rendering feature context...");
+			logger::info("NeuralNR: Initializing Neural Rendering feature context...");
 			if (!CreateFeature()) {
-				logger::warn("NeuralNR: Feature creation failed. Retrying in 1 second...");
+				logger::warn("NeuralNR: Snippet CreateFeature rejected. Retrying...");
 				back->Release();
 				return;
 			}
@@ -274,7 +275,6 @@ void NeuralNR::OnPresent()
 
 	auto* P = s.nrParams;
 	
-	// Extents and Dimensions are strictly mapped as unsigned ints to align with snippet expectations
 	P->Set("DLSSNR.Width",  static_cast<unsigned int>(w));
 	P->Set("DLSSNR.Height", static_cast<unsigned int>(h));
 	P->Set(NVSDK_NGX_Parameter_Width,  static_cast<unsigned int>(w));
@@ -338,7 +338,7 @@ void NeuralNR::OnPresent()
 	P->Set("MV.Scale.Y",    settings.mvScaleY);
 	P->Set("Depth.Inverted",static_cast<unsigned int>(settings.depthInverted));
 
-	// 4. Feature Execution via Snippet Pipeline
+	// 5. Snippet Execution
 	CSS::CallerSpoof::Install();
 	NVSDK_NGX_Result evalRes = ((PFN_EvaluateFeature)s.pfnEvaluateFeature)(
 		ctx, s.nrFeature, P, nullptr);
@@ -385,12 +385,11 @@ void NeuralNR::PostPostLoad()
 		s.pfnEvaluateFeature = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
 		logger::info("NeuralNR: Target snippet loaded. Exports resolved.");
 	} else {
-		logger::warn("NeuralNR: Target snippet nvngx_dlssnr.dll could not be loaded into memory.");
+		logger::warn("NeuralNR: Target snippet nvngx_dlssnr.dll could not be loaded.");
 		return;
 	}
 
-	// Trigger the background interceptor thread to hijack GetProcAddress from CommunityShaders.dll immediately
-	CSS::CallerSpoof::InstallStreamlineHooks();
+	CSS::CallerSpoof::InstallUpscalerHooks();
 }
 
 void NeuralNR::Reset() { GetState().needsReset = true; }

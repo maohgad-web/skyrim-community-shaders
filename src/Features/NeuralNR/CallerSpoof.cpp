@@ -3,29 +3,11 @@
 #include "Utils/FileSystem.h"
 #include "Globals.h"
 #include <windows.h>
+#include <thread>
 #include <vector>
 
 namespace CSS::CallerSpoof
 {
-	enum slFeature : uint32_t { kFeatureDLSS_NR = 1004 }; 
-	
-	struct slPreferences {
-		bool showConsole;
-		int logLevel;
-		void* pathsToPlugins;
-		uint32_t numPathsToPlugins;
-		const slFeature* featuresToLoad;
-		uint32_t numFeaturesToLoad;
-		uint32_t renderAPI;
-	};
-
-	typedef int (*slInit_t)(const slPreferences*, void*, void*);
-	typedef int (*slIsFeatureSupported_t)(slFeature, const void*);
-	
-	static slInit_t s_orig_slInit = nullptr;
-	static slIsFeatureSupported_t s_orig_slIsFeatureSupported = nullptr;
-	static std::vector<slFeature> s_modifiedFeatures;
-
 	using PFN_CreateFeature = NVSDK_NGX_Result (*)(ID3D11DeviceContext*, NVSDK_NGX_Feature, NVSDK_NGX_Parameter*, NVSDK_NGX_Handle**);
 	static PFN_CreateFeature s_orig_NGXCreate = nullptr;
 
@@ -33,8 +15,7 @@ namespace CSS::CallerSpoof
 	static PFN_EvaluateFeature s_orig_NGXEvaluate = nullptr;
 
 	using GetProcAddress_t = FARPROC(WINAPI*)(HMODULE, LPCSTR);
-	static GetProcAddress_t s_origGetProcAddress_Host = nullptr;
-	static GetProcAddress_t s_origGetProcAddress_Streamline = nullptr;
+	static GetProcAddress_t s_origGetProcAddress = nullptr;
 
 	using GetModuleFileNameW_t = DWORD(WINAPI*)(HMODULE, LPWSTR, DWORD);
 	static GetModuleFileNameW_t s_origK32 = nullptr;
@@ -61,44 +42,85 @@ namespace CSS::CallerSpoof
 		return 0;
 	}
 
-	// --- 3. Streamline NGX Interceptors ---
+	// --- SEH-Guarded Diagnostic Interceptors ---
 	static NVSDK_NGX_Result Hooked_NGXCreate(ID3D11DeviceContext* ctx, NVSDK_NGX_Feature feat, NVSDK_NGX_Parameter* param, NVSDK_NGX_Handle** handle)
 	{
 		auto& s = NeuralNR::GetState();
 		
-		// Target SuperSampling (Feature 1) to steal Streamline's globally validated parameter block
-		if (!s.streamlineContextCaptured && param && feat == NVSDK_NGX_Feature_SuperSampling)
+		logger::info("NeuralNR [Diag]: Intercepted Streamline CreateFeature! Target FeatureID: {}", static_cast<uint32_t>(feat));
+
+		if (!s.streamlineContextCaptured && param)
 		{
-			logger::info("NeuralNR [Streamline]: Pipeline intercepted! Captured globally validated NGX_Parameter block from DLSS-SR (Feature 1) Create event.");
-			s.nrParams = param;
-			s.streamlineContextCaptured = true;
+			__try {
+				logger::info("NeuralNR [Diag]: Stealing validated NGX_Parameter block from active CreateFeature event: {}", (void*)param);
+				s.nrParams = param;
+				s.streamlineContextCaptured = true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				logger::warn("NeuralNR [Diag]: SEH caught access violation during CreateFeature parameter steal.");
+			}
 		}
 
-		if (s_orig_NGXCreate) return s_orig_NGXCreate(ctx, feat, param, handle);
+		if (s_orig_NGXCreate) {
+			__try {
+				return s_orig_NGXCreate(ctx, feat, param, handle);
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				logger::warn("NeuralNR [Diag]: SEH caught crash inside original Streamline CreateFeature!");
+				return static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
+			}
+		}
 		return static_cast<NVSDK_NGX_Result>(0xBAD00007);
 	}
 
 	static NVSDK_NGX_Result Hooked_NGXEvaluate(ID3D11DeviceContext* ctx, NVSDK_NGX_Handle* feat, NVSDK_NGX_Parameter* param, void* info)
 	{
-		if (s_orig_NGXEvaluate) return s_orig_NGXEvaluate(ctx, feat, param, info);
+		auto& s = NeuralNR::GetState();
+		
+		static uint32_t logCounter = 0;
+		if (logCounter++ % 300 == 0) {
+			logger::info("NeuralNR [Diag]: Streamline EvaluateFeature is running mid-game. Handle={}, ParamBlock={}", (void*)feat, (void*)param);
+		}
+
+		if (!s.streamlineContextCaptured && param)
+		{
+			__try {
+				logger::info("NeuralNR [Diag]: Stealing validated NGX_Parameter block from active EvaluateFeature event: {}", (void*)param);
+				s.nrParams = param;
+				s.streamlineContextCaptured = true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				logger::warn("NeuralNR [Diag]: SEH caught access violation during EvaluateFeature parameter steal.");
+			}
+		}
+
+		if (s_orig_NGXEvaluate) {
+			__try {
+				return s_orig_NGXEvaluate(ctx, feat, param, info);
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				logger::warn("NeuralNR [Diag]: SEH caught crash inside original Streamline EvaluateFeature!");
+				return static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
+			}
+		}
 		return static_cast<NVSDK_NGX_Result>(0xBAD00007);
 	}
 
-	static FARPROC WINAPI Hooked_GetProcAddress_Streamline(HMODULE hModule, LPCSTR lpProcName)
+	static FARPROC WINAPI Hooked_GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
 	{
 		if (lpProcName && ((ULONG_PTR)lpProcName > 0xFFFF))
 		{
-			if (_stricmp(lpProcName, "NVSDK_NGX_D3D11_CreateFeature") == 0) {
-				if (!s_orig_NGXCreate) s_orig_NGXCreate = (PFN_CreateFeature)(s_origGetProcAddress_Streamline ? s_origGetProcAddress_Streamline(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
+			if (_stricmp(lpProcName, "NVSDK_NGX_D3D11_CreateFeature") == 0)
+			{
+				if (!s_orig_NGXCreate) s_orig_NGXCreate = (PFN_CreateFeature)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
 				return (FARPROC)Hooked_NGXCreate;
 			}
-			if (_stricmp(lpProcName, "NVSDK_NGX_D3D11_EvaluateFeature") == 0) {
-				if (!s_orig_NGXEvaluate) s_orig_NGXEvaluate = (PFN_EvaluateFeature)(s_origGetProcAddress_Streamline ? s_origGetProcAddress_Streamline(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
+			if (_stricmp(lpProcName, "NVSDK_NGX_D3D11_EvaluateFeature") == 0)
+			{
+				if (!s_orig_NGXEvaluate) s_orig_NGXEvaluate = (PFN_EvaluateFeature)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
 				return (FARPROC)Hooked_NGXEvaluate;
 			}
 		}
 		
-		if (s_origGetProcAddress_Streamline) return s_origGetProcAddress_Streamline(hModule, lpProcName);
+		if (s_origGetProcAddress) return s_origGetProcAddress(hModule, lpProcName);
 		return ::GetProcAddress(hModule, lpProcName);
 	}
 
@@ -145,75 +167,52 @@ namespace CSS::CallerSpoof
 		}
 	}
 
-	// --- 2. slInit Interceptor ---
-	int Hooked_slInit(const slPreferences* pref, void* app, void* device)
+	static void StreamlineHookThread()
 	{
-		logger::info("NeuralNR [Streamline]: slInit intercepted! Installing NGX interceptors inside Streamline BEFORE they resolve...");
+		const wchar_t* targetModules[] = {
+			L"sl.interposer.dll",
+			L"sl.common.dll",
+			L"sl.dlss.dll",
+			L"sl.dlss_g.dll",
+			L"sl.dlss_nr.dll",
+			L"sl.reflex.dll",
+			L"sl.nis.dll",
+			L"sl.pcl.dll",
+			L"nvngx.dll",
+			L"_nvngx.dll"
+		};
 
-		HMODULE hInterposer = GetModuleHandleW(L"sl.interposer.dll");
-		HMODULE hDLSS       = GetModuleHandleW(L"sl.dlss.dll");
+		std::vector<bool> hookedStatus(std::size(targetModules), false);
+		int totalHooked = 0;
+		int targetCount = static_cast<int>(std::size(targetModules));
 
-		if (hInterposer) PatchModuleIATAny(hInterposer, "GetProcAddress", (void*)Hooked_GetProcAddress_Streamline, (void**)&s_origGetProcAddress_Streamline);
-		if (hDLSS)       PatchModuleIATAny(hDLSS,       "GetProcAddress", (void*)Hooked_GetProcAddress_Streamline, (void**)&s_origGetProcAddress_Streamline);
-
-		slPreferences modPref = *pref;
-		s_modifiedFeatures.clear();
-		
-		bool nrFound = false;
-		if (pref->featuresToLoad && pref->numFeaturesToLoad > 0) {
-			for (uint32_t i = 0; i < pref->numFeaturesToLoad; ++i) {
-				s_modifiedFeatures.push_back(pref->featuresToLoad[i]);
-				if (pref->featuresToLoad[i] == kFeatureDLSS_NR) nrFound = true;
+		while (totalHooked < targetCount) {
+			for (int i = 0; i < targetCount; ++i) {
+				if (!hookedStatus[i]) {
+					HMODULE hMod = GetModuleHandleW(targetModules[i]);
+					if (hMod) {
+						PatchModuleIATAny(hMod, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
+						
+						// Convert wchar_t to char safely for logging
+						char logName[64];
+						size_t converted = 0;
+						wcstombs_s(&converted, logName, sizeof(logName), targetModules[i], _TRUNCATE);
+						
+						logger::info("NeuralNR [Diag]: Successfully attached GetProcAddress hijack to {}.", logName);
+						hookedStatus[i] = true;
+						totalHooked++;
+					}
+				}
 			}
+			Sleep(200);
 		}
 		
-		if (!nrFound) {
-			s_modifiedFeatures.push_back(kFeatureDLSS_NR);
-			modPref.featuresToLoad = s_modifiedFeatures.data();
-			modPref.numFeaturesToLoad = static_cast<uint32_t>(s_modifiedFeatures.size());
-			logger::info("NeuralNR [Streamline]: Dynamically injected Feature 1004 into slPreferences.");
-		}
-		
-		return s_orig_slInit(&modPref, app, device);
+		logger::info("NeuralNR [Diag]: All Streamline and NGX modules actively intercepted.");
 	}
 
-	int Hooked_slIsFeatureSupported(slFeature feature, const void* pArch)
-	{
-		if (feature == kFeatureDLSS_NR) return 0; 
-		return s_orig_slIsFeatureSupported(feature, pArch);
-	}
-
-	// --- 1. CommunityShaders.dll GetProcAddress Interceptor ---
-	static FARPROC WINAPI Hooked_GetProcAddress_Host(HMODULE hModule, LPCSTR lpProcName)
-	{
-		if (lpProcName && ((ULONG_PTR)lpProcName > 0xFFFF))
-		{
-			if (_stricmp(lpProcName, "slInit") == 0) {
-				if (!s_orig_slInit) s_orig_slInit = (slInit_t)(s_origGetProcAddress_Host ? s_origGetProcAddress_Host(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
-				return (FARPROC)Hooked_slInit;
-			}
-			if (_stricmp(lpProcName, "slIsFeatureSupported") == 0) {
-				if (!s_orig_slIsFeatureSupported) s_orig_slIsFeatureSupported = (slIsFeatureSupported_t)(s_origGetProcAddress_Host ? s_origGetProcAddress_Host(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
-				return (FARPROC)Hooked_slIsFeatureSupported;
-			}
-		}
-		
-		if (s_origGetProcAddress_Host) return s_origGetProcAddress_Host(hModule, lpProcName);
-		return ::GetProcAddress(hModule, lpProcName);
-	}
-
-	// --- 0. Initial Installer ---
 	void InstallStreamlineHooks()
 	{
-		// Target Community Shaders directly since it handles Upscaling natively
-		HMODULE hHost = GetModuleHandleW(L"CommunityShaders.dll");
-		
-		if (hHost) {
-			PatchModuleIATAny(hHost, "GetProcAddress", (void*)Hooked_GetProcAddress_Host, (void**)&s_origGetProcAddress_Host);
-			logger::info("NeuralNR [Diag]: Hooked GetProcAddress in CommunityShaders.dll. Waiting for CS to initialize Streamline...");
-		} else {
-			logger::error("NeuralNR [Diag]: Could not find CommunityShaders.dll in memory.");
-		}
+		std::thread(StreamlineHookThread).detach();
 	}
 
 	void Install()

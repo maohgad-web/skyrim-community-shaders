@@ -5,5 +5,6 @@ namespace CSS::CallerSpoof
 	void Install();
 	void Uninstall();
 	
-	void InstallStreamlineHooks();
+	void InstallUpscalerHooks();
+	bool InstallActiveInterceptors();
 }
