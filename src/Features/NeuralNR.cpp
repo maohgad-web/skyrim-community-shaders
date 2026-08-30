@@ -10,101 +10,13 @@
 #include <dxgi1_6.h>
 #include <fstream>
 #include <sstream>
-#include <string>
-#include <filesystem>
 #include <imgui.h>
 
 namespace
 {
 	constexpr int kFeatureDLSSNR = 18;
 
-	using PFN_GetCapParams       = NVSDK_NGX_Result (*)(NVSDK_NGX_Parameter**);
-	using PFN_CreateFeature      = decltype(&NVSDK_NGX_D3D11_CreateFeature);
-	using PFN_EvaluateFeature    = decltype(&NVSDK_NGX_D3D11_EvaluateFeature);
-	using PFN_ReleaseFeature     = decltype(&NVSDK_NGX_D3D11_ReleaseFeature);
-
-	using PFN_InitExt_Std = NVSDK_NGX_Result (*)(
-		unsigned long long InApplicationId,
-		const wchar_t* InApplicationDataPath,
-		ID3D11Device* InDevice,
-		const NVSDK_NGX_FeatureCommonInfo* InFeatureInfo,
-		NVSDK_NGX_Version InSDKVersion);
-
-	using PFN_SnippetInit_Strategy1 = NVSDK_NGX_Result (*)(
-		unsigned long long InApplicationId,
-		const wchar_t* InApplicationDataPath,
-		ID3D11Device* InDevice,
-		NVSDK_NGX_Version InSDKVersion,
-		NVSDK_NGX_Parameter* InParameters);
-
-	using PFN_SnippetInit_Strategy2 = PFN_InitExt_Std;
-
-	using PFN_SnippetInit_Strategy3 = NVSDK_NGX_Result (*)(
-		unsigned long long InApplicationId,
-		const wchar_t* InApplicationDataPath,
-		ID3D11Device* InDevice,
-		NVSDK_NGX_Version InSDKVersion,
-		const NVSDK_NGX_FeatureCommonInfo* InFeatureInfo);
-
-	NVSDK_NGX_Result CallSnippetInit_Strategy1_SEH(
-		FARPROC pfn,
-		unsigned long long appId,
-		const wchar_t* appPath,
-		ID3D11Device* dev,
-		NVSDK_NGX_Version ver,
-		NVSDK_NGX_Parameter* params,
-		bool* outFaulted)
-	{
-		if (outFaulted) *outFaulted = false;
-		__try {
-			auto fn = reinterpret_cast<PFN_SnippetInit_Strategy1>(pfn);
-			return fn(appId, appPath, dev, ver, params);
-		}
-		__except (EXCEPTION_EXECUTE_HANDLER) {
-			if (outFaulted) *outFaulted = true;
-			return static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
-		}
-	}
-
-	NVSDK_NGX_Result CallSnippetInit_Strategy2_SEH(
-		FARPROC pfn,
-		unsigned long long appId,
-		const wchar_t* appPath,
-		ID3D11Device* dev,
-		const NVSDK_NGX_FeatureCommonInfo* featInfo,
-		NVSDK_NGX_Version ver,
-		bool* outFaulted)
-	{
-		if (outFaulted) *outFaulted = false;
-		__try {
-			auto fn = reinterpret_cast<PFN_SnippetInit_Strategy2>(pfn);
-			return fn(appId, appPath, dev, featInfo, ver);
-		}
-		__except (EXCEPTION_EXECUTE_HANDLER) {
-			if (outFaulted) *outFaulted = true;
-			return static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
-		}
-	}
-
-	NVSDK_NGX_Result CallSnippetInit_Strategy3_SEH(
-		FARPROC pfn,
-		unsigned long long appId,
-		const wchar_t* appPath,
-		ID3D11Device* dev,
-		NVSDK_NGX_Version ver,
-		const NVSDK_NGX_FeatureCommonInfo* featInfo,
-		bool* outFaulted)
-	{
-		if (outFaulted) *outFaulted = false;
-		__try {
-			auto fn = reinterpret_cast<PFN_SnippetInit_Strategy3>(pfn);
-			return fn(appId, appPath, dev, ver, featInfo);
-		}
-		__except (EXCEPTION_EXECUTE_HANDLER) {
-			if (outFaulted) *outFaulted = true;
-			return static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
-		}
-	}
+	using PFN_EvaluateFeature = NVSDK_NGX_Result (*)(ID3D11DeviceContext*, NVSDK_NGX_Handle*, NVSDK_NGX_Parameter*, void*);
 
 	bool IsActuallyHDROutput(IDXGISwapChain* swapChain)
 	{
@@ -133,61 +45,6 @@ ID3D11Resource* NeuralNR::ResourceFromView(ID3D11View* view) const
 	view->GetResource(&res);
 	if (res) res->Release();
 	return res;
-}
-
-void NeuralNR::LoadDLL()
-{
-	auto& s = GetState();
-
-	s.hDLL = GetModuleHandleW(L"_nvngx.dll");
-	if (!s.hDLL) s.hDLL = GetModuleHandleW(L"nvngx.dll");
-	if (!s.hDLL) s.hDLL = LoadLibraryW(L"nvngx.dll");
-	if (!s.hDLL) s.hDLL = LoadLibraryW(L"_nvngx.dll");
-
-	if (!s.hDLL)
-	{
-		logger::warn("NeuralNR: Could not find the core NGX library (nvngx.dll or _nvngx.dll) — Streamline/DLSS may not have initialized it yet.");
-	}
-	else
-	{
-		s.pfnInitExt                 = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_Init");
-		if (!s.pfnInitExt) s.pfnInitExt = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_Init_Ext");
-		s.pfnGetCapabilityParameters = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_GetCapabilityParameters");
-	}
-
-	std::wstring snippetPath = Util::PathHelpers::GetShadersPath() / L"Upscaling" / L"Streamline" / L"nvngx_dlssnr.dll";
-	s.hSnippetDLL = LoadLibraryW(snippetPath.c_str());
-
-	if (s.hSnippetDLL)
-	{
-		s.pfnPopulateParams = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_PopulateParameters_Impl");
-		// Create, Evaluate, and Release are resolved dynamically in CreateFeature based on Core Routing success
-	}
-	else
-	{
-		logger::warn("NeuralNR: Could not load snippet nvngx_dlssnr.dll directly.");
-	}
-}
-
-bool NeuralNR::CheckGate()
-{
-	auto dev = globals::d3d::device;
-	IDXGIDevice* dxgiDev = nullptr;
-	if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&dxgiDev)))) return false;
-	IDXGIAdapter* adp = nullptr;
-	bool ok = SUCCEEDED(dxgiDev->GetAdapter(&adp));
-	dxgiDev->Release();
-	if (!ok || !adp) return false;
-	IDXGIAdapter1* adp1 = nullptr;
-	ok = SUCCEEDED(adp->QueryInterface(IID_PPV_ARGS(&adp1)));
-	adp->Release();
-	if (!ok || !adp1) return false;
-	DXGI_ADAPTER_DESC1 d{};
-	adp1->GetDesc1(&d);
-	adp1->Release();
-	if (d.VendorId != 0x10DE) return false;
-	if (globals::features::upscaling.GetUpscaleMethod() != Upscaling::UpscaleMethod::kDLSS) return false;
-	return true;
 }
 
 bool NeuralNR::CompileShaders()
@@ -226,60 +83,6 @@ bool NeuralNR::CompileShaders()
 
 	return compile("NeuralNR_SDRProxy.hlsl", "CS_GenerateSDRProxy", &s.proxyCS)
 		&& compile("NeuralNR_Transfer.hlsl", "CS_TransferEditToHDR", &s.transferCS);
-}
-
-bool NeuralNR::CreateFeature()
-{
-	auto& s = GetState();
-	if (!s.nrParams) return false;
-
-	// CRITICAL FIX: Dynamic Core Routing
-	// Fetching Create pointers from both modules to bypass FAIL_NotInitialized (0xBAD00007).
-	auto pfnCoreCreate    = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_CreateFeature");
-	auto pfnSnippetCreate = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_CreateFeature");
-
-	CSS::CallerSpoof::Install();
-	
-	NVSDK_NGX_Result res = static_cast<NVSDK_NGX_Result>(0xBAD00007);
-
-	// Try the Core _nvngx.dll first. Streamline already initialized it.
-	if (pfnCoreCreate) {
-		logger::info("NeuralNR: Attempting CreateFeature via Core NGX Subsystem...");
-		res = ((PFN_CreateFeature)pfnCoreCreate)(
-			globals::d3d::context, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), s.nrParams, &s.nrFeature);
-		
-		if (NVSDK_NGX_SUCCEED(res) && s.nrFeature) {
-			logger::info("NeuralNR: Core accepted Feature creation! Binding Evaluate directly to Core.");
-			s.pfnEvaluateFeature = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
-			s.pfnReleaseFeature  = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_ReleaseFeature");
-		}
-	}
-
-	// Fallback to Snippet directly if Core rejects the ID
-	if (!NVSDK_NGX_SUCCEED(res) || !s.nrFeature) {
-		logger::warn("NeuralNR: Core CreateFeature failed (0x{:X}). Attempting direct Snippet creation...", static_cast<uint32_t>(res));
-		if (pfnSnippetCreate) {
-			res = ((PFN_CreateFeature)pfnSnippetCreate)(
-				globals::d3d::context, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), s.nrParams, &s.nrFeature);
-				
-			if (NVSDK_NGX_SUCCEED(res) && s.nrFeature) {
-				logger::info("NeuralNR: Snippet accepted Feature creation! Binding Evaluate directly to Snippet.");
-				s.pfnEvaluateFeature = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
-				s.pfnReleaseFeature  = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_ReleaseFeature");
-			}
-		}
-	}
-		
-	CSS::CallerSpoof::Uninstall();
-
-	if (!NVSDK_NGX_SUCCEED(res) || !s.nrFeature)
-	{
-		logger::error("NeuralNR: CreateFeature failed completely across all modules, res=0x{:X}", static_cast<uint32_t>(res));
-		return false;
-	}
-	
-	logger::info("NeuralNR: CreateFeature Success.");
-	return true;
 }
 
 void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
@@ -376,16 +179,6 @@ void NeuralNR::ReleaseResources()
 	rel(&s.proxyCS); rel(&s.transferCS); rel(&s.tuningCB);
 }
 
-void NeuralNR::ReleaseFeature()
-{
-	auto& s = GetState();
-	if (s.pfnReleaseFeature && s.nrFeature)
-		((PFN_ReleaseFeature)s.pfnReleaseFeature)(s.nrFeature);
-		
-	s.nrParams = nullptr;
-	s.nrFeature = nullptr;
-}
-
 void NeuralNR::DispatchProxy()
 {
 	auto& s = GetState(); auto ctx = globals::d3d::context;
@@ -418,22 +211,12 @@ void NeuralNR::OnPresent()
 
 	auto& s = GetState();
 
-	if (!s.nrParams) 
+	// Passively wait for CallerSpoof to successfully capture the Streamline context
+	if (!s.streamlineContextCaptured || !s.nrFeature || !s.nrParams || !s.pfnEvaluateFeature) 
 	{
-		static uint32_t s_modulePollCounter = 0;
-		static uint32_t s_moduleLoadAttempts = 0;
-		constexpr uint32_t kModulePollInterval = 120;
-		constexpr uint32_t kMaxModulePollAttempts = 300;
-
-		const bool firstAttempt = (s_moduleLoadAttempts == 0);
-		const bool dueForRetry  = (++s_modulePollCounter >= kModulePollInterval) && (s_moduleLoadAttempts < kMaxModulePollAttempts);
-		
-		if (firstAttempt || dueForRetry)
-		{
-			s_modulePollCounter = 0;
-			++s_moduleLoadAttempts;
-			PostPostLoad();
-		}
+		static uint32_t s_waitCounter = 0;
+		if (++s_waitCounter % 300 == 1)
+			logger::info("NeuralNR: Passively waiting for Streamline to inject and authorize Feature 1004...");
 		return; 
 	}
 
@@ -445,181 +228,45 @@ void NeuralNR::OnPresent()
 	if (s.w != w || s.h != h) s.needsReset = true;
 	CreateResources(w, h, dsc.Format);
 
+	// The 3D Scene Gate
 	if (!s.mvSRV || !s.depthSRV) 
 	{
 		static uint32_t s_resourceWaitCounter = 0;
 		if (++s_resourceWaitCounter % 300 == 1)
-			logger::info("NeuralNR: Waiting for active 3D scene (Depth/MVec) before handshake...");
+			logger::info("NeuralNR: Streamline context stolen! Waiting for active 3D scene (Depth/MVec)...");
 		back->Release(); 
 		return; 
 	}
 
-	auto* P = s.nrParams;
-	P->Set("DLSSNR.Width",  (int)w);
-	P->Set("DLSSNR.Height", (int)h);
-	P->Set(NVSDK_NGX_Parameter_Width,  (int)w);
-	P->Set(NVSDK_NGX_Parameter_Height, (int)h);
-	P->Set(NVSDK_NGX_Parameter_OutWidth,  (int)w);
-	P->Set(NVSDK_NGX_Parameter_OutHeight, (int)h);
-	
-	auto SetSubrect = [&](const char* name) {
-		P->Set((std::string(name) + "SubrectBaseX").c_str(), 0);
-		P->Set((std::string(name) + "SubrectBaseY").c_str(), 0);
-		P->Set((std::string(name) + "SubrectWidth").c_str(),  (int)w);
-		P->Set((std::string(name) + "SubrectHeight").c_str(), (int)h);
-	};
-	SetSubrect("DLSSNR.Color"); 
-	SetSubrect("DLSSNR.MVec");
-	SetSubrect("DLSSNR.Depth"); 
-	SetSubrect("DLSSNR.Output");
-
-	if (!s.initialized)
-	{
-		static uint32_t s_createRetry = 0;
-		static uint32_t s_cooldownFrames = 0;
-		static int s_strategy = 1;
-		static bool s_snippetInitialized = false;
-		static bool s_capabilitiesChecked = false;
-
-		if (s_cooldownFrames > 0)
-		{
-			s_cooldownFrames--;
-			back->Release();
-			return;
-		}
-
-		if (s_createRetry++ % 60 == 0) 
-		{
-			if (s_strategy > 4) {
-				logger::error("NeuralNR: Matrix exhausted. Restarting handshake loop in 10 seconds...");
-				s_strategy = 1; 
-				s_snippetInitialized = false;
-				s_capabilitiesChecked = false; 
-				s_cooldownFrames = 600; 
-				s_createRetry = 0;
-				back->Release();
-				return;
-			}
-
-			if (!s_capabilitiesChecked)
-			{
-				logger::info("NeuralNR: Pre-validating hardware capabilities for Feature DLSSNR (18)...");
-				int featureAvailable = 0;
-				NVSDK_NGX_Result availRes = P->Get("SuperSampling.Available", &featureAvailable);
-				
-				if (NVSDK_NGX_SUCCEED(availRes) && featureAvailable == 1) {
-					logger::info("NeuralNR: SuperSampling is natively supported by silicon.");
-					s_capabilitiesChecked = true;
-				} else {
-					logger::warn("NeuralNR: SuperSampling capability check failed. Injecting overrides...");
-					P->Set("DLSSNR.Available", 1);
-					P->Set("SuperSampling.Available", 1);
-					P->Set("NVSDK_NGX_Parameter_DevOverride", 1);
-					P->Set("NVSDK_NGX_Parameter_FeatureInitFlags", 1);
-					s_capabilitiesChecked = true;
-				}
-			}
-
-			if (!s_snippetInitialized) 
-			{
-				logger::info("NeuralNR: --- Executing Snippet Init Strategy {} ---", s_strategy);
-				
-				static std::wstring appPath = Util::PathHelpers::GetFeatureShaderPath("NeuralNR").wstring();
-				static std::wstring dllSearchPath = appPath;
-				if (!std::filesystem::exists(Util::PathHelpers::GetFeatureShaderPath("NeuralNR") / L"nvngx_dlssnr.dll")) {
-					dllSearchPath = (Util::PathHelpers::GetShadersPath() / L"Upscaling" / L"Streamline").wstring();
-				}
-				static const wchar_t* searchPaths[] = { dllSearchPath.c_str() };
-				static NVSDK_NGX_FeatureCommonInfo featureInfo{};
-				featureInfo.PathListInfo.Path = searchPaths;
-				featureInfo.PathListInfo.Length = 1;
-
-				auto pfnInitExt = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_Init_Ext");
-				if (!pfnInitExt) pfnInitExt = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_Init");
-
-				NVSDK_NGX_Result snippetInitRes = static_cast<NVSDK_NGX_Result>(-1);
-				bool faulted = false;
-
-				CSS::CallerSpoof::Install();
-
-				if (s_strategy == 1 && pfnInitExt) {
-					logger::info("NeuralNR: Strategy 1 -> Snippet ABI + Capability Injection");
-					snippetInitRes = CallSnippetInit_Strategy1_SEH(
-						reinterpret_cast<FARPROC>(pfnInitExt), 231313132ULL, appPath.c_str(),
-						globals::d3d::device, NVSDK_NGX_Version_API, s.nrParams, &faulted);
-				}
-				else if (s_strategy == 2 && pfnInitExt) {
-					logger::info("NeuralNR: Strategy 2 -> Standard ABI");
-					snippetInitRes = CallSnippetInit_Strategy2_SEH(
-						reinterpret_cast<FARPROC>(pfnInitExt), 231313132ULL, appPath.c_str(),
-						globals::d3d::device, &featureInfo, NVSDK_NGX_Version_API, &faulted);
-				}
-				else if (s_strategy == 3 && pfnInitExt) {
-					logger::info("NeuralNR: Strategy 3 -> Flipped ABI");
-					snippetInitRes = CallSnippetInit_Strategy3_SEH(
-						reinterpret_cast<FARPROC>(pfnInitExt), 231313132ULL, appPath.c_str(),
-						globals::d3d::device, NVSDK_NGX_Version_API, &featureInfo, &faulted);
-				}
-				else if (s_strategy == 4) {
-					logger::info("NeuralNR: Strategy 4 -> Bypass Snippet Init, direct Parameter Population");
-					snippetInitRes = static_cast<NVSDK_NGX_Result>(1); 
-				}
-
-				CSS::CallerSpoof::Uninstall();
-
-				if (faulted) logger::error("NeuralNR: Strategy {} triggered an Access Violation (Recovered).", s_strategy);
-
-				if (NVSDK_NGX_SUCCEED(snippetInitRes) && !faulted) {
-					logger::info("NeuralNR: Strategy {} Snippet Handshake Succeeded!", s_strategy);
-					s_snippetInitialized = true;
-					if (s.pfnPopulateParams) {
-						using PFN_Populate = NVSDK_NGX_Result (*)(NVSDK_NGX_Parameter*);
-						((PFN_Populate)s.pfnPopulateParams)(s.nrParams);
-					}
-				} else {
-					logger::warn("NeuralNR: Strategy {} Snippet Handshake Failed (0x{:X}).", s_strategy, static_cast<uint32_t>(snippetInitRes));
-					s_strategy++;
-					back->Release();
-					return;
-				}
-			}
-
-			if (s_snippetInitialized && !s.nrFeature) {
-				if (CreateFeature()) {
-					s.initialized = true;
-					logger::info("NeuralNR: Initialization fully stabilized on Strategy {}.", s_strategy);
-				} else {
-					logger::warn("NeuralNR: CreateFeature rejected Strategy {}. Advancing matrix...", s_strategy);
-					s_snippetInitialized = false; 
-					s_strategy++;
-					back->Release();
-					return;
-				}
-			}
-		}
-		else
-		{
-			back->Release();
-			return; 
-		}
-	}
-
-	if (!s.nrFeature || !s.pfnEvaluateFeature)
-	{
-		back->Release();
-		return;
-	}
-
 	const bool hdr = IsActuallyHDROutput(globals::d3d::swapChain);
-
 	ctx->CopyResource(s.inputColor, back);
 	if (hdr) DispatchProxy();
 
-	P->Set("DLSSNR.Hint.Render.Preset", settings.preset);
-	P->Set("DLSSNR.Enabled", 1);
+	auto* P = s.nrParams;
+	
+	P->Set("DLSSNR.Width",  static_cast<unsigned int>(w));
+	P->Set("DLSSNR.Height", static_cast<unsigned int>(h));
+	P->Set(NVSDK_NGX_Parameter_Width,  static_cast<unsigned int>(w));
+	P->Set(NVSDK_NGX_Parameter_Height, static_cast<unsigned int>(h));
+	P->Set(NVSDK_NGX_Parameter_OutWidth,  static_cast<unsigned int>(w));
+	P->Set(NVSDK_NGX_Parameter_OutHeight, static_cast<unsigned int>(h));
+
+	auto SetSubrect = [&](const char* name) {
+		P->Set((std::string("DLSSNR.") + name + "SubrectBaseX").c_str(), 0u);
+		P->Set((std::string("DLSSNR.") + name + "SubrectBaseY").c_str(), 0u);
+		P->Set((std::string("DLSSNR.") + name + "SubrectWidth").c_str(),  static_cast<unsigned int>(w));
+		P->Set((std::string("DLSSNR.") + name + "SubrectHeight").c_str(), static_cast<unsigned int>(h));
+	};
+	SetSubrect("Color"); 
+	SetSubrect("MVec");
+	SetSubrect("Depth"); 
+	SetSubrect("Output");
+
+	P->Set("DLSSNR.Hint.Render.Preset", static_cast<unsigned int>(settings.preset));
+	P->Set("DLSSNR.Enabled", 1u);
 	if (s.needsReset.exchange(false)) {
-		P->Set("DLSSNR.Reset", 1);
-		P->Set("Reset", 1);
+		P->Set("DLSSNR.Reset", 1u);
+		P->Set("Reset", 1u);
 	}
 	
 	P->Set("DLSSNR.Style",                 settings.style);
@@ -627,10 +274,12 @@ void NeuralNR::OnPresent()
 	P->Set("DLSSNR.LocalToneStrength",     settings.localTone);
 	P->Set("DLSSNR.LocalStructureStrength",settings.localStructure);
 	P->Set("DLSSNR.SkinStructureStrength", settings.skinStructure);
-	P->Set("DLSSNR.UseAutoMask",           settings.useAutoMask);
+	P->Set("DLSSNR.UseAutoMask",           static_cast<unsigned int>(settings.useAutoMask));
 	P->Set("DLSSNR.MVecScaleX",            settings.mvScaleX);
 	P->Set("DLSSNR.MVecScaleY",            settings.mvScaleY);
-	P->Set("DLSSNR.DepthInverted",         settings.depthInverted);
+	P->Set("DLSSNR.DepthInverted",         static_cast<unsigned int>(settings.depthInverted));
+	P->Set("NRPaperWhiteNits",             settings.paperWhiteNits);
+	P->Set("NREncodeStrength",             settings.encodeStrength);
 
 	auto colorRes = (ID3D11Resource*)(hdr ? s.sdrProxyTex : s.inputColor);
 	auto outRes   = (ID3D11Resource*)s.nrOutputTex;
@@ -652,17 +301,15 @@ void NeuralNR::OnPresent()
 	P->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, 0.0f);
 	P->Set("MV.Scale.X",    settings.mvScaleX);
 	P->Set("MV.Scale.Y",    settings.mvScaleY);
-	P->Set("Depth.Inverted",settings.depthInverted);
+	P->Set("Depth.Inverted",static_cast<unsigned int>(settings.depthInverted));
 
-	CSS::CallerSpoof::Install();
 	NVSDK_NGX_Result evalRes = ((PFN_EvaluateFeature)s.pfnEvaluateFeature)(
 		ctx, s.nrFeature, P, nullptr);
-	CSS::CallerSpoof::Uninstall();
 
 	static bool s_loggedEval = false;
 	if (NVSDK_NGX_SUCCEED(evalRes) && !s_loggedEval)
 	{
-		logger::info("NeuralNR: First frame evaluated successfully! Format=0x{:X}", static_cast<uint32_t>(dsc.Format));
+		logger::info("NeuralNR: Stolen Streamline context evaluated successfully! Format=0x{:X}", static_cast<uint32_t>(dsc.Format));
 		s_loggedEval = true;
 	}
 	else if (!NVSDK_NGX_SUCCEED(evalRes))
@@ -675,8 +322,6 @@ void NeuralNR::OnPresent()
 			s_lastLoggedFailure = evalRes;
 			s_failureLogFrameCounter = 0;
 		}
-		back->Release();
-		return;
 	}
 
 	if (hdr) { DispatchTransfer(); ctx->CopyResource(back, s.transferOut); }
@@ -686,46 +331,12 @@ void NeuralNR::OnPresent()
 
 void NeuralNR::PostPostLoad()
 {
-	auto& s = GetState();
-	LoadDLL();
-	
-	if (!CheckGate())
-	{ logger::info("NeuralNR: gate failed — disabled"); return; }
-	
 	if (!CompileShaders())
 	{ logger::info("NeuralNR: shader compile failed"); return; }
 
-	static std::wstring appPath = Util::PathHelpers::GetFeatureShaderPath("NeuralNR").wstring();
-	static std::wstring dllSearchPath = appPath;
-
-	if (!std::filesystem::exists(Util::PathHelpers::GetFeatureShaderPath("NeuralNR") / L"nvngx_dlssnr.dll"))
-	{
-		dllSearchPath = (Util::PathHelpers::GetShadersPath() / L"Upscaling" / L"Streamline").wstring();
-	}
-
-	static const wchar_t* searchPaths[] = { dllSearchPath.c_str() };
-	
-	static NVSDK_NGX_FeatureCommonInfo featureInfo{};
-	featureInfo.PathListInfo.Path = searchPaths;
-	featureInfo.PathListInfo.Length = 1;
-
-	if (s.pfnInitExt)
-	{
-		NVSDK_NGX_Result initRes = ((PFN_InitExt_Std)s.pfnInitExt)(
-			231313132ULL, appPath.c_str(), globals::d3d::device, &featureInfo, NVSDK_NGX_Version_API
-		);
-
-		if (!NVSDK_NGX_SUCCEED(initRes))
-			logger::warn("NeuralNR: Core Init failed. Proceeding to allocate parameters via Streamline context..."); 
-	}
-
-	if (!s.pfnGetCapabilityParameters) return;
-
-	NVSDK_NGX_Result capRes = ((PFN_GetCapParams)s.pfnGetCapabilityParameters)(&s.nrParams);
-
-	if (!NVSDK_NGX_SUCCEED(capRes) || !s.nrParams) return;
-
-	logger::info("NeuralNR: Core context acquired. Snippet initialization deferred to active render cycle.");
+	// Fire the memory patches immediately.
+	// This will trick Streamline into compiling the parameter block for us during engine startup.
+	CSS::CallerSpoof::InstallStreamlineHooks();
 }
 
 void NeuralNR::Reset() { GetState().needsReset = true; }
