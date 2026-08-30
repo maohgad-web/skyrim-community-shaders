@@ -25,8 +25,6 @@ namespace
 	using PFN_ReleaseFeature     = decltype(&NVSDK_NGX_D3D11_ReleaseFeature);
 	using PFN_DestroyParams      = decltype(&NVSDK_NGX_D3D11_DestroyParameters);
 
-	void* s_pfnReleaseFeature = nullptr;
-
 	bool IsActuallyHDROutput(IDXGISwapChain* swapChain)
 	{
 		bool isHDR = false;
@@ -69,13 +67,27 @@ void NeuralNR::LoadDLL()
 		return;
 	}
 
+	// 1. Get the parameter allocators from the Core
 	s.pfnInitExt            = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_Init");
 	s.pfnAllocateParameters = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_AllocateParameters");
-	s.pfnCreateFeature      = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_CreateFeature");
-	s.pfnEvaluateFeature    = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
 	s.pfnDestroyParameters  = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_DestroyParameters");
-	s.pfnReleaseFeature     = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_ReleaseFeature");
-	s_pfnReleaseFeature     = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_ReleaseFeature");
+
+	// 2. Bypass the Core's blacklist by loading the Snippet directly
+	std::wstring snippetPath = Util::PathHelpers::GetShadersPath() / L"Upscaling" / L"Streamline" / L"nvngx_dlssnr.dll";
+	s.hSnippetDLL = LoadLibraryW(snippetPath.c_str());
+
+	if (s.hSnippetDLL)
+	{
+		// 3. Extract the feature functions directly from the snippet
+		s.pfnPopulateParams   = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_PopulateParameters_Impl");
+		s.pfnCreateFeature    = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_CreateFeature");
+		s.pfnEvaluateFeature  = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
+		s.pfnReleaseFeature   = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_ReleaseFeature");
+	}
+	else
+	{
+		logger::warn("NeuralNR: Could not load snippet nvngx_dlssnr.dll directly.");
+	}
 }
 
 bool NeuralNR::CheckGate()
@@ -183,7 +195,7 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 	};
 
 	auto tryCreateMotionVectorTexture = [&]() {
-		if (s.mvSRV) return;
+		if (s.mvSRV) return; 
 		if (auto* mv = globals::features::upscaling.motionVectorCopyTexture)
 		{
 			auto* raw = static_cast<ID3D11Texture2D*>(mv->resource.get());
@@ -196,9 +208,22 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 		}
 	};
 
+	auto tryCreateDepthTexture = [&]() {
+		if (s.depthSRV) return;
+		auto* depthSRV = globals::game::renderer->GetDepthStencilData()
+			.depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN].depthSRV;
+		if (depthSRV)
+		{
+			s.depthSRV = depthSRV;
+			s.depthSRV->AddRef();
+			logger::info("NeuralNR: Native Depth SRV successfully acquired!");
+		}
+	};
+
 	if (!sizeChanged)
 	{
 		tryCreateMotionVectorTexture();
+		tryCreateDepthTexture();
 		return;
 	}
 
@@ -217,33 +242,7 @@ void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 	mkUAV(s.transferOut, hdrFmt, &s.transferOutUAV);
 
 	tryCreateMotionVectorTexture();
-
-	// Continuously retry fetching the depth buffer if it wasn't ready on frame 1
-	if (!s.depthSRV)
-	{
-		auto* depthSRV = globals::game::renderer->GetDepthStencilData()
-			.depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN].depthSRV;
-		if (depthSRV)
-		{
-			ID3D11Resource* dres = nullptr;
-			depthSRV->GetResource(&dres);
-			if (dres)
-			{
-				ID3D11Texture2D* dtex = nullptr;
-				if (SUCCEEDED(dres->QueryInterface(IID_PPV_ARGS(&dtex))))
-				{
-					D3D11_TEXTURE2D_DESC dd{}; dtex->GetDesc(&dd);
-					D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-					sd.Format = DXGI_FORMAT_R32_FLOAT;
-					sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sd.Texture2D.MipLevels = 1;
-					if (SUCCEEDED(dev->CreateShaderResourceView(dtex, &sd, &s.depthSRV)))
-						logger::info("NeuralNR: Depth SRV successfully acquired!");
-					dtex->Release();
-				}
-				dres->Release();
-			}
-		}
-	}
+	tryCreateDepthTexture();
 
 	struct Tuning { float paperWhite, encode, _0, _1; };
 	Tuning t{ settings.paperWhiteNits, settings.encodeStrength, 0.f, 0.f };
@@ -268,8 +267,8 @@ void NeuralNR::ReleaseFeature()
 	auto& s = GetState();
 	if (s.pfnDestroyParameters && s.nrParams)
 		((PFN_DestroyParams)s.pfnDestroyParameters)(s.nrParams);
-	if (s_pfnReleaseFeature && s.nrFeature)
-		((PFN_ReleaseFeature)s_pfnReleaseFeature)(s.nrFeature);
+	if (s.pfnReleaseFeature && s.nrFeature)
+		((PFN_ReleaseFeature)s.pfnReleaseFeature)(s.nrFeature);
 	s.nrParams = nullptr;
 	s.nrFeature = nullptr;
 }
@@ -329,8 +328,6 @@ void NeuralNR::OnPresent()
 	if (s.w != w || s.h != h) s.needsReset = true;
 	CreateResources(w, h, dsc.Format);
 
-	if (!s.inputColor || !s.nrOutputTex || !s.mvSRV || !s.depthSRV) { back->Release(); return; }
-
 	auto* P = s.nrParams;
 
 	P->Set(NVSDK_NGX_Parameter_Width,  (int)w);
@@ -357,6 +354,18 @@ void NeuralNR::OnPresent()
 			back->Release();
 			return;
 		}
+	}
+
+	if (!s.inputColor || !s.nrOutputTex || !s.mvSRV || !s.depthSRV) 
+	{
+		static uint32_t s_resourceWaitCounter = 0;
+		if (++s_resourceWaitCounter % 300 == 1)
+		{
+			logger::info("NeuralNR: Feature created! Waiting for active scene render targets (Depth={}, MVec={})...",
+				s.depthSRV != nullptr, s.mvSRV != nullptr);
+		}
+		back->Release(); 
+		return; 
 	}
 
 	const bool hdr = IsActuallyHDROutput(globals::d3d::swapChain);
@@ -421,8 +430,8 @@ void NeuralNR::PostPostLoad()
 	auto& s = GetState();
 	LoadDLL();
 	
-	if (!s.hDLL || !s.pfnCreateFeature || !s.pfnEvaluateFeature)
-	{ logger::info("NeuralNR: Core DLL or required exports not found — disabled"); return; }
+	if (!s.hSnippetDLL || !s.pfnCreateFeature || !s.pfnEvaluateFeature)
+	{ logger::info("NeuralNR: Snippet DLL or required exports not found — disabled"); return; }
 	
 	if (!CheckGate())
 	{ logger::info("NeuralNR: gate failed — disabled"); return; }
@@ -465,6 +474,13 @@ void NeuralNR::PostPostLoad()
 	if (!s.nrParams)
 	{ logger::info("NeuralNR: AllocateParameters failed"); return; }
 	
+	if (s.pfnPopulateParams)
+	{
+		using PFN_Populate = NVSDK_NGX_Result (*)(NVSDK_NGX_Parameter*);
+		((PFN_Populate)s.pfnPopulateParams)(s.nrParams);
+		logger::info("NeuralNR: Snippet parameters populated successfully.");
+	}
+
 	logger::info("NeuralNR: ready to create feature");
 }
 

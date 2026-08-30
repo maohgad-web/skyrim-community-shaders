@@ -20,7 +20,6 @@ struct NeuralNR : public Feature
     void SaveSettings(json& o_json) override;
     void Reset() override;
 
-    // Non-static: allows access to settings and private member methods
     void OnPresent();
     bool IsEnabled() { return settings.enabled; }
 
@@ -39,14 +38,19 @@ private:
     {
         bool initialized = false;
         std::atomic<bool> needsReset{true};
+        
         HMODULE hDLL = nullptr;
+        HMODULE hSnippetDLL = nullptr; // Bypasses core nvngx.dll
+        
         NVSDK_NGX_Handle* nrFeature = nullptr;
         NVSDK_NGX_Parameter* nrParams = nullptr;
+        
         void* pfnInitExt = nullptr;
         void* pfnAllocateParameters = nullptr;
+        void* pfnPopulateParams = nullptr; // Forces snippet to configure parameters
         void* pfnCreateFeature = nullptr;
         void* pfnEvaluateFeature = nullptr;
-        void* pfnReleaseFeature = nullptr; // Added to match NeuralNR.cpp
+        void* pfnReleaseFeature = nullptr; 
         void* pfnDestroyParameters = nullptr;
 
         ID3D11Texture2D* inputColor = nullptr;
