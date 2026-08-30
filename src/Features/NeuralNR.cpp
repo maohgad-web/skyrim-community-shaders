@@ -86,6 +86,7 @@ bool NeuralNR::CreateFeature()
 	auto& s = GetState();
 	if (!s.pfnCreateFeature || !s.nrParams) return false;
 
+	// Execute feature creation directly against the target snippet DLL using stolen parameters
 	CSS::CallerSpoof::Install();
 	NVSDK_NGX_Result res = ((PFN_CreateFeature)s.pfnCreateFeature)(
 		globals::d3d::context, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), s.nrParams, &s.nrFeature);
@@ -227,15 +228,15 @@ void NeuralNR::OnPresent()
 
 	auto& s = GetState();
 
-	// 1. Dynamic Interceptor Poll: continuously attach to Streamline & DLSS modules as they load
+	// 1. Dynamic Interceptor Poll: continuously patch GetProcAddress as DLLs load
 	CSS::CallerSpoof::InstallActiveInterceptors();
 
-	// 2. Await parameter steal from active DLSS execution
+	// 2. Await parameter steal from DLSS-SR (Feature 1) initialization
 	if (!s.streamlineContextCaptured || !s.nrParams || !s.pfnEvaluateFeature || !s.pfnCreateFeature) 
 	{
 		static uint32_t s_waitCounter = 0;
 		if (++s_waitCounter % 300 == 1)
-			logger::info("NeuralNR: Interceptors active. Waiting for DLSS frame execution to capture NGX parameters...");
+			logger::info("NeuralNR: Interceptors active. Waiting for DLSS-SR (Feature 1) creation to capture NGX parameters...");
 		return; 
 	}
 
@@ -257,11 +258,11 @@ void NeuralNR::OnPresent()
 		return; 
 	}
 
-	// 4. Feature Creation on Snippet using the Stolen Parameter Block
+	// 4. Manual Snippet Feature Creation (Leveraging Stolen Parameters)
 	if (!s.nrFeature) {
 		static uint32_t s_createRetry = 0;
 		if (s_createRetry++ % 60 == 0) {
-			logger::info("NeuralNR: Initializing Neural Rendering feature context...");
+			logger::info("NeuralNR: Establishing Neural Rendering feature context...");
 			if (!CreateFeature()) {
 				logger::warn("NeuralNR: Snippet CreateFeature rejected. Retrying...");
 				back->Release();
@@ -385,7 +386,7 @@ void NeuralNR::PostPostLoad()
 		s.pfnEvaluateFeature = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
 		logger::info("NeuralNR: Target snippet loaded. Exports resolved.");
 	} else {
-		logger::warn("NeuralNR: Target snippet nvngx_dlssnr.dll could not be loaded.");
+		logger::warn("NeuralNR: Target snippet nvngx_dlssnr.dll could not be loaded into memory.");
 		return;
 	}
 

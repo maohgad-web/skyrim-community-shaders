@@ -32,6 +32,9 @@ namespace CSS::CallerSpoof
 	using PFN_EvaluateFeature = NVSDK_NGX_Result (*)(ID3D11DeviceContext*, NVSDK_NGX_Handle*, NVSDK_NGX_Parameter*, void*);
 	static PFN_EvaluateFeature s_orig_NGXEvaluate = nullptr;
 
+	using GetProcAddress_t = FARPROC(WINAPI*)(HMODULE, LPCSTR);
+	static GetProcAddress_t s_origGetProcAddress = nullptr;
+
 	using GetModuleFileNameW_t = DWORD(WINAPI*)(HMODULE, LPWSTR, DWORD);
 	static GetModuleFileNameW_t s_origK32 = nullptr;
 	static HMODULE s_ourModule = nullptr;
@@ -57,47 +60,56 @@ namespace CSS::CallerSpoof
 		return 0;
 	}
 
-	// Active Interceptor: Evaluates every frame passing through Streamline / DLSS-SR
-	static NVSDK_NGX_Result Hooked_NGXEvaluate(ID3D11DeviceContext* ctx, NVSDK_NGX_Handle* feat, NVSDK_NGX_Parameter* param, void* info)
+	// --- Active Interceptor: Feature Gate Steal ---
+	static NVSDK_NGX_Result Hooked_NGXCreate(ID3D11DeviceContext* ctx, NVSDK_NGX_Feature feat, NVSDK_NGX_Parameter* param, NVSDK_NGX_Handle** handle)
 	{
 		auto& s = NeuralNR::GetState();
 		
-		static uint32_t s_evalPassCounter = 0;
-		if (++s_evalPassCounter % 300 == 1)
+		// Gate the steal exactly as you suggested: Target SuperSampling (Feature ID 1)
+		// Streamline validates this block for DLSS-SR. We steal it to use for DLSS-NR.
+		if (!s.streamlineContextCaptured && param && feat == NVSDK_NGX_Feature_SuperSampling)
 		{
-			logger::info("NeuralNR [Diag]: Active EvaluateFeature intercepted! Handle={}, ParamBlock={}", 
-				(void*)feat, (void*)param);
-		}
-
-		if (!s.streamlineContextCaptured && param)
-		{
-			logger::info("NeuralNR [Streamline]: DLSS-SR frame intercepted! Captured validated NGX_Parameter block at {}", (void*)param);
-			s.nrParams = param;
-			s.streamlineContextCaptured = true;
-		}
-
-		if (s_orig_NGXEvaluate) {
-			return s_orig_NGXEvaluate(ctx, feat, param, info);
-		}
-		return NVSDK_NGX_Result_Fail;
-	}
-
-	// Active Interceptor: Traps any feature creation events
-	static NVSDK_NGX_Result Hooked_NGXCreate(ID3D11DeviceContext* ctx, NVSDK_NGX_Feature feat, NVSDK_NGX_Parameter* param, NVSDK_NGX_Handle** handle)
-	{
-		logger::info("NeuralNR [Diag]: Active CreateFeature intercepted! FeatureID={}, ParamBlock={}", 
-			static_cast<uint32_t>(feat), (void*)param);
-
-		auto& s = NeuralNR::GetState();
-		if (!s.streamlineContextCaptured && param)
-		{
-			logger::info("NeuralNR [Streamline]: Captured NGX_Parameter block from CreateFeature event.");
+			logger::info("NeuralNR [Streamline]: Captured globally validated NGX_Parameter block from DLSS-SR (Feature 1) Create event.");
 			s.nrParams = param;
 			s.streamlineContextCaptured = true;
 		}
 
 		if (s_orig_NGXCreate) return s_orig_NGXCreate(ctx, feat, param, handle);
 		return static_cast<NVSDK_NGX_Result>(0xBAD00007);
+	}
+
+	static NVSDK_NGX_Result Hooked_NGXEvaluate(ID3D11DeviceContext* ctx, NVSDK_NGX_Handle* feat, NVSDK_NGX_Parameter* param, void* info)
+	{
+		// Passive observer just to maintain the pipeline execution flow
+		if (s_orig_NGXEvaluate) {
+			return s_orig_NGXEvaluate(ctx, feat, param, info);
+		}
+		return static_cast<NVSDK_NGX_Result>(0xBAD00007);
+	}
+
+	// --- IAT Evasion Bypass: Hook GetProcAddress ---
+	static FARPROC WINAPI Hooked_GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
+	{
+		if (lpProcName && ((ULONG_PTR)lpProcName > 0xFFFF))
+		{
+			if (_stricmp(lpProcName, "NVSDK_NGX_D3D11_CreateFeature") == 0)
+			{
+				if (!s_orig_NGXCreate) {
+					s_orig_NGXCreate = (PFN_CreateFeature)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
+				}
+				return (FARPROC)Hooked_NGXCreate;
+			}
+			if (_stricmp(lpProcName, "NVSDK_NGX_D3D11_EvaluateFeature") == 0)
+			{
+				if (!s_orig_NGXEvaluate) {
+					s_orig_NGXEvaluate = (PFN_EvaluateFeature)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
+				}
+				return (FARPROC)Hooked_NGXEvaluate;
+			}
+		}
+		
+		if (s_origGetProcAddress) return s_origGetProcAddress(hModule, lpProcName);
+		return ::GetProcAddress(hModule, lpProcName);
 	}
 
 	int Hooked_slInit(const slPreferences* pref, void* app, void* device)
@@ -128,8 +140,7 @@ namespace CSS::CallerSpoof
 	int Hooked_slIsFeatureSupported(slFeature feature, const void* pArch)
 	{
 		if (feature == kFeatureDLSS_NR) {
-			logger::info("NeuralNR [Streamline]: slIsFeatureSupported(1004) queried -> Returning supported.");
-			return 0; 
+			return 0; // Force supported response
 		}
 		return s_orig_slIsFeatureSupported(feature, pArch);
 	}
@@ -194,33 +205,24 @@ namespace CSS::CallerSpoof
 	{
 		static bool s_interposerHooked = false;
 		static bool s_dlssHooked = false;
-		static bool s_coreHooked = false;
 
 		HMODULE hInterposer = GetModuleHandleW(L"sl.interposer.dll");
 		HMODULE hDLSS       = GetModuleHandleW(L"sl.dlss.dll");
-		HMODULE hCore       = GetModuleHandleW(L"_nvngx.dll");
 
+		// Target GetProcAddress to intercept Streamline's dynamic function resolution
 		if (hInterposer && !s_interposerHooked) {
-			bool p1 = PatchModuleIATAny(hInterposer, "NVSDK_NGX_D3D11_EvaluateFeature", (void*)Hooked_NGXEvaluate, (void**)&s_orig_NGXEvaluate);
-			bool p2 = PatchModuleIATAny(hInterposer, "NVSDK_NGX_D3D11_CreateFeature",   (void*)Hooked_NGXCreate,   (void**)&s_orig_NGXCreate);
-			logger::info("NeuralNR [Diag]: Hooked sl.interposer.dll (Eval={}, Create={})", p1, p2);
+			bool p1 = PatchModuleIATAny(hInterposer, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
+			logger::info("NeuralNR [Diag]: Hooked sl.interposer.dll GetProcAddress={}", p1);
 			s_interposerHooked = true;
 		}
 
 		if (hDLSS && !s_dlssHooked) {
-			bool p1 = PatchModuleIATAny(hDLSS, "NVSDK_NGX_D3D11_EvaluateFeature", (void*)Hooked_NGXEvaluate, (void**)&s_orig_NGXEvaluate);
-			bool p2 = PatchModuleIATAny(hDLSS, "NVSDK_NGX_D3D11_CreateFeature",   (void*)Hooked_NGXCreate,   (void**)&s_orig_NGXCreate);
-			logger::info("NeuralNR [Diag]: Hooked sl.dlss.dll (Eval={}, Create={})", p1, p2);
+			bool p1 = PatchModuleIATAny(hDLSS, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
+			logger::info("NeuralNR [Diag]: Hooked sl.dlss.dll GetProcAddress={}", p1);
 			s_dlssHooked = true;
 		}
 
-		if (hCore && !s_coreHooked) {
-			bool p1 = PatchModuleIATAny(hCore, "NVSDK_NGX_D3D11_EvaluateFeature", (void*)Hooked_NGXEvaluate, (void**)&s_orig_NGXEvaluate);
-			logger::info("NeuralNR [Diag]: Hooked _nvngx.dll (Eval={})", p1);
-			s_coreHooked = true;
-		}
-
-		return (s_interposerHooked || s_dlssHooked || s_coreHooked);
+		return (s_interposerHooked || s_dlssHooked);
 	}
 
 	void Install()
