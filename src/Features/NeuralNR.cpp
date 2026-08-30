@@ -19,11 +19,10 @@ namespace
 	constexpr int kFeatureDLSSNR = 18;
 
 	using PFN_InitExt            = decltype(&NVSDK_NGX_D3D11_Init);
-	using PFN_AllocParams        = decltype(&NVSDK_NGX_D3D11_AllocateParameters);
+	using PFN_GetCapParams       = NVSDK_NGX_Result (*)(NVSDK_NGX_Parameter**);
 	using PFN_CreateFeature      = decltype(&NVSDK_NGX_D3D11_CreateFeature);
 	using PFN_EvaluateFeature    = decltype(&NVSDK_NGX_D3D11_EvaluateFeature);
 	using PFN_ReleaseFeature     = decltype(&NVSDK_NGX_D3D11_ReleaseFeature);
-	using PFN_DestroyParams      = decltype(&NVSDK_NGX_D3D11_DestroyParameters);
 
 	bool IsActuallyHDROutput(IDXGISwapChain* swapChain)
 	{
@@ -67,10 +66,9 @@ void NeuralNR::LoadDLL()
 		return;
 	}
 
-	// 1. Get the parameter allocators from the Core
-	s.pfnInitExt            = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_Init");
-	s.pfnAllocateParameters = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_AllocateParameters");
-	s.pfnDestroyParameters  = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_DestroyParameters");
+	// 1. Get the capability block retriever from the Core
+	s.pfnInitExt                 = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_Init");
+	s.pfnGetCapabilityParameters = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_GetCapabilityParameters");
 
 	// 2. Bypass the Core's blacklist by loading the Snippet directly
 	std::wstring snippetPath = Util::PathHelpers::GetShadersPath() / L"Upscaling" / L"Streamline" / L"nvngx_dlssnr.dll";
@@ -265,10 +263,11 @@ void NeuralNR::ReleaseResources()
 void NeuralNR::ReleaseFeature()
 {
 	auto& s = GetState();
-	if (s.pfnDestroyParameters && s.nrParams)
-		((PFN_DestroyParams)s.pfnDestroyParameters)(s.nrParams);
+	
+	// FIX: Do NOT destroy the capability parameter block, the NGX core owns it.
 	if (s.pfnReleaseFeature && s.nrFeature)
 		((PFN_ReleaseFeature)s.pfnReleaseFeature)(s.nrFeature);
+		
 	s.nrParams = nullptr;
 	s.nrFeature = nullptr;
 }
@@ -466,13 +465,14 @@ void NeuralNR::PostPostLoad()
 		logger::warn("NeuralNR: Init_Ext failed with result code: 0x{:X}. Proceeding to allocate parameters via Streamline context...", static_cast<uint32_t>(initRes)); 
 	}
 
-	if (!s.pfnAllocateParameters)
-	{ logger::info("NeuralNR: AllocateParameters export missing"); return; }
+	if (!s.pfnGetCapabilityParameters)
+	{ logger::info("NeuralNR: GetCapabilityParameters export missing from core"); return; }
 
-	((PFN_AllocParams)s.pfnAllocateParameters)(&s.nrParams);
+	// FIX: Grab the core's capability block, DO NOT allocate a blank one!
+	NVSDK_NGX_Result capRes = ((PFN_GetCapParams)s.pfnGetCapabilityParameters)(&s.nrParams);
 
-	if (!s.nrParams)
-	{ logger::info("NeuralNR: AllocateParameters failed"); return; }
+	if (!NVSDK_NGX_SUCCEED(capRes) || !s.nrParams)
+	{ logger::info("NeuralNR: GetCapabilityParameters failed"); return; }
 	
 	if (s.pfnPopulateParams)
 	{

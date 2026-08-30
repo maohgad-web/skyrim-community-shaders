@@ -46,12 +46,11 @@ private:
         NVSDK_NGX_Parameter* nrParams = nullptr;
         
         void* pfnInitExt = nullptr;
-        void* pfnAllocateParameters = nullptr;
+        void* pfnGetCapabilityParameters = nullptr; // Gets core block instead of allocating a blank one
         void* pfnPopulateParams = nullptr; // Forces snippet to configure parameters
         void* pfnCreateFeature = nullptr;
         void* pfnEvaluateFeature = nullptr;
         void* pfnReleaseFeature = nullptr; 
-        void* pfnDestroyParameters = nullptr;
 
         ID3D11Texture2D* inputColor = nullptr;
         ID3D11Texture2D* sdrProxyTex = nullptr;
