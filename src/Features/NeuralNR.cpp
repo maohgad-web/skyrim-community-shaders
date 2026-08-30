@@ -86,7 +86,6 @@ bool NeuralNR::CreateFeature()
 	auto& s = GetState();
 	if (!s.pfnCreateFeature || !s.nrParams) return false;
 
-	// Execute feature creation directly against the target snippet DLL (Section 2)
 	CSS::CallerSpoof::Install();
 	NVSDK_NGX_Result res = ((PFN_CreateFeature)s.pfnCreateFeature)(
 		globals::d3d::context, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), s.nrParams, &s.nrFeature);
@@ -228,25 +227,15 @@ void NeuralNR::OnPresent()
 
 	auto& s = GetState();
 
-	// 1. Install Dynamic Interposer Hooks when Streamline initializes
-	if (!s.streamlineHooksInstalled) {
-		HMODULE hInterposer = GetModuleHandleW(L"sl.interposer.dll");
-		if (!hInterposer) hInterposer = GetModuleHandleW(L"sl.dlss.dll");
+	// 1. Dynamic Interceptor Poll: continuously attach to Streamline & DLSS modules as they load
+	CSS::CallerSpoof::InstallActiveInterceptors();
 
-		if (hInterposer) {
-			CSS::CallerSpoof::InstallInterposerHooks(hInterposer);
-			s.streamlineHooksInstalled = true;
-		} else {
-			return; // Wait for Streamline
-		}
-	}
-
-	// 2. Wait for Streamline Context
-	if (!s.streamlineContextCaptured || !s.nrParams || !s.pfnEvaluateFeature) 
+	// 2. Await parameter steal from active DLSS execution
+	if (!s.streamlineContextCaptured || !s.nrParams || !s.pfnEvaluateFeature || !s.pfnCreateFeature) 
 	{
 		static uint32_t s_waitCounter = 0;
 		if (++s_waitCounter % 300 == 1)
-			logger::info("NeuralNR: Passively waiting for Streamline to create DLSS-SR and expose the NGX parameter block...");
+			logger::info("NeuralNR: Interceptors active. Waiting for DLSS frame execution to capture NGX parameters...");
 		return; 
 	}
 
@@ -258,23 +247,23 @@ void NeuralNR::OnPresent()
 	if (s.w != w || s.h != h) s.needsReset = true;
 	CreateResources(w, h, dsc.Format);
 
-	// 3. Await 3D Scene
+	// 3. 3D Scene Gate
 	if (!s.mvSRV || !s.depthSRV) 
 	{
 		static uint32_t s_resourceWaitCounter = 0;
 		if (++s_resourceWaitCounter % 300 == 1)
-			logger::info("NeuralNR: Streamline context stolen! Waiting for active 3D scene (Depth/MVec)...");
+			logger::info("NeuralNR: Parameter context acquired! Waiting for 3D depth and motion vectors...");
 		back->Release(); 
 		return; 
 	}
 
-	// 4. Manual Snippet Feature Creation (Leveraging Stolen Parameters)
+	// 4. Feature Creation on Snippet using the Stolen Parameter Block
 	if (!s.nrFeature) {
 		static uint32_t s_createRetry = 0;
 		if (s_createRetry++ % 60 == 0) {
-			logger::info("NeuralNR: Establishing Neural Rendering feature context...");
+			logger::info("NeuralNR: Initializing Neural Rendering feature context...");
 			if (!CreateFeature()) {
-				logger::warn("NeuralNR: Feature creation failed. Retrying in 1 second...");
+				logger::warn("NeuralNR: Snippet CreateFeature rejected. Retrying...");
 				back->Release();
 				return;
 			}
@@ -286,7 +275,6 @@ void NeuralNR::OnPresent()
 
 	auto* P = s.nrParams;
 	
-	// Parameters MUST be passed as unsigned int for dimensions/booleans[cite: 9]
 	P->Set("DLSSNR.Width",  static_cast<unsigned int>(w));
 	P->Set("DLSSNR.Height", static_cast<unsigned int>(h));
 	P->Set(NVSDK_NGX_Parameter_Width,  static_cast<unsigned int>(w));
@@ -350,7 +338,7 @@ void NeuralNR::OnPresent()
 	P->Set("MV.Scale.Y",    settings.mvScaleY);
 	P->Set("Depth.Inverted",static_cast<unsigned int>(settings.depthInverted));
 
-	// 5. Feature Execution via Snippet Pipeline
+	// 5. Snippet Execution
 	CSS::CallerSpoof::Install();
 	NVSDK_NGX_Result evalRes = ((PFN_EvaluateFeature)s.pfnEvaluateFeature)(
 		ctx, s.nrFeature, P, nullptr);
@@ -395,13 +383,12 @@ void NeuralNR::PostPostLoad()
 	if (s.hSnippetDLL) {
 		s.pfnCreateFeature = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_CreateFeature");
 		s.pfnEvaluateFeature = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
-		logger::info("NeuralNR: Snippet target located. Binding internal exports...");
+		logger::info("NeuralNR: Target snippet loaded. Exports resolved.");
 	} else {
-		logger::warn("NeuralNR: Target snippet nvngx_dlssnr.dll could not be loaded into memory.");
+		logger::warn("NeuralNR: Target snippet nvngx_dlssnr.dll could not be loaded.");
 		return;
 	}
 
-	// Install the slInit hook immediately at boot so Streamline authorizes Feature 1004 internally
 	CSS::CallerSpoof::InstallUpscalerHooks();
 }
 

@@ -8,5 +8,5 @@ namespace CSS::CallerSpoof
 	void Uninstall();
 	
 	void InstallUpscalerHooks();
-	void InstallInterposerHooks(HMODULE hInterposer);
+	bool InstallActiveInterceptors();
 }
