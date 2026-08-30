@@ -16,7 +16,6 @@
 
 namespace
 {
-	// Confirmed via documentation: DLSS Neural Rendering is Feature 18.
 	constexpr int kFeatureDLSSNR = 18;
 
 	using PFN_GetCapParams       = NVSDK_NGX_Result (*)(NVSDK_NGX_Parameter**);
@@ -24,7 +23,7 @@ namespace
 	using PFN_EvaluateFeature    = decltype(&NVSDK_NGX_D3D11_EvaluateFeature);
 	using PFN_ReleaseFeature     = decltype(&NVSDK_NGX_D3D11_ReleaseFeature);
 
-	// Explicitly define the standard Init signature to avoid ABI corruption
+	// CRITICAL FIX: The correct SDK signature for standard Init_Ext puts FeatureInfo BEFORE SDKVersion.
 	using PFN_InitExt_Std = NVSDK_NGX_Result (*)(
 		unsigned long long InApplicationId,
 		const wchar_t* InApplicationDataPath,
@@ -165,6 +164,8 @@ bool NeuralNR::CreateFeature()
 	NVSDK_NGX_Result res = ((PFN_CreateFeature)s.pfnCreateFeature)(
 		globals::d3d::context, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), s.nrParams, &s.nrFeature);
 		
+	CSS::CallerSpoof::Uninstall();
+
 	if (!NVSDK_NGX_SUCCEED(res) || !s.nrFeature)
 	{
 		logger::error("NeuralNR: CreateFeature failed, res=0x{:X}", static_cast<uint32_t>(res));
@@ -477,7 +478,7 @@ void NeuralNR::PostPostLoad()
 	featureInfo.PathListInfo.Path = searchPaths;
 	featureInfo.PathListInfo.Length = 1;
 
-	// Core Init (Uses the explicit Standard signature, passing FeatureCommonInfo)
+	// Core Init (Uses the standard NGX signature where FeatureInfo precedes SDKVersion)
 	if (s.pfnInitExt)
 	{
 		NVSDK_NGX_Result initRes = ((PFN_InitExt_Std)s.pfnInitExt)(
@@ -503,7 +504,6 @@ void NeuralNR::PostPostLoad()
 	{ logger::info("NeuralNR: GetCapabilityParameters failed"); return; }
 
 	// CRITICAL FIX: Snippet Initialization Signatures
-	// The snippet may export Init_Ext2 (which takes the parameter block) or standard Init_Ext (which takes FeatureCommonInfo).
 	auto pfnSnippetInitExt2 = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_Init_Ext2");
 	auto pfnSnippetInitExt  = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_Init_Ext");
 
@@ -511,13 +511,13 @@ void NeuralNR::PostPostLoad()
 
 	if (pfnSnippetInitExt2)
 	{
-		// D3D11 Snippet Init_Ext2 signature
+		// D3D11 Snippet Init_Ext2 signature (SDKVersion precedes the Parameter block)
 		using PFN_SnippetInitExt2 = NVSDK_NGX_Result (*)(
 			unsigned long long InApplicationId,
 			const wchar_t* InApplicationDataPath,
 			ID3D11Device* InDevice,
 			NVSDK_NGX_Version InSDKVersion,
-			NVSDK_NGX_Parameter* InParameters);
+			const NVSDK_NGX_Parameter* InParameters);
 
 		NVSDK_NGX_Result snippetInitRes = ((PFN_SnippetInitExt2)pfnSnippetInitExt2)(
 			231313132ULL, appPath.c_str(), globals::d3d::device, NVSDK_NGX_Version_API, s.nrParams
@@ -544,6 +544,8 @@ void NeuralNR::PostPostLoad()
 	{
 		logger::warn("NeuralNR: Could not find any Init_Ext export in snippet DLL.");
 	}
+
+	CSS::CallerSpoof::Uninstall(); // Ensure the caller spoof hook is removed to prevent leaks
 
 	if (s.pfnPopulateParams)
 	{
