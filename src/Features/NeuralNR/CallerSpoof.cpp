@@ -241,11 +241,30 @@ namespace CSS::CallerSpoof
 				{
 					PatchModuleIATAny(hMod, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
 
+					// PATCH: alongside the GetProcAddress hijack (which only
+					// catches a FUTURE dynamic lookup), also directly patch
+					// this module's own IAT entries for CreateFeature/
+					// EvaluateFeature by name if it imports them at all. This
+					// catches the case the GetProcAddress hook structurally
+					// can't: a static import resolved by the Windows loader
+					// at load time (no runtime GetProcAddress call ever
+					// happens for it), or a dynamic lookup that already
+					// completed before our hooks attached. Confirmed twice
+					// now (two separate test sessions) that GetProcAddress
+					// alone never caught a single CreateFeature/
+					// EvaluateFeature call despite DLSS SR running the whole
+					// time — this is the direct-patch fallback for that gap.
+					// Harmless no-op on any module that doesn't import these
+					// by name at all (PatchModuleIATAny just won't find a
+					// matching entry to patch).
+					PatchModuleIATAny(hMod, "NVSDK_NGX_D3D11_CreateFeature", (void*)Hooked_NGXCreate, (void**)&s_orig_NGXCreate);
+					PatchModuleIATAny(hMod, "NVSDK_NGX_D3D11_EvaluateFeature", (void*)Hooked_NGXEvaluate, (void**)&s_orig_NGXEvaluate);
+
 					char logName[64];
 					size_t converted = 0;
 					wcstombs_s(&converted, logName, sizeof(logName), s_targetModules[i], _TRUNCATE);
 
-					logger::info("NeuralNR [Diag]: Successfully attached GetProcAddress hijack to {}.", logName);
+					logger::info("NeuralNR [Diag]: Successfully attached GetProcAddress + direct CreateFeature/EvaluateFeature hijack to {}.", logName);
 					s_hookedStatus[i] = true;
 				}
 				else
