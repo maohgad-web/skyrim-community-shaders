@@ -164,7 +164,6 @@ void NeuralNR::LoadDLL()
 	}
 	else
 	{
-		// Layer 1: Confirmed safe plain Init symbol as the primary core target
 		s.pfnInitExt                 = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_Init");
 		if (!s.pfnInitExt) s.pfnInitExt = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_Init_Ext");
 		s.pfnGetCapabilityParameters = GetProcAddress(s.hDLL, "NVSDK_NGX_D3D11_GetCapabilityParameters");
@@ -594,7 +593,11 @@ void NeuralNR::OnPresent()
 
 	P->Set("DLSSNR.Hint.Render.Preset", settings.preset);
 	P->Set("DLSSNR.Enabled", 1);
-	if (s.needsReset.exchange(false)) P->Set("DLSSNR.Reset", 1);
+	if (s.needsReset.exchange(false)) {
+		P->Set("DLSSNR.Reset", 1);
+		P->Set("Reset", 1);
+	}
+	
 	P->Set("DLSSNR.Style",                 settings.style);
 	P->Set("DLSSNR.Intensity",             settings.intensity);
 	P->Set("DLSSNR.LocalToneStrength",     settings.localTone);
@@ -607,13 +610,31 @@ void NeuralNR::OnPresent()
 	P->Set("NRPaperWhiteNits",             settings.paperWhiteNits);
 	P->Set("NREncodeStrength",             settings.encodeStrength);
 
-	P->Set("DLSSNR.Color",  (ID3D11Resource*)(hdr ? s.sdrProxyTex : s.inputColor));
-	P->Set("DLSSNR.Output", (ID3D11Resource*)s.nrOutputTex);
-	P->Set("DLSSNR.MVec",   ResourceFromView(s.mvSRV));
-	P->Set("DLSSNR.Depth",  ResourceFromView(s.depthSRV));
+	// Resolve hardware pointers safely
+	auto colorRes = (ID3D11Resource*)(hdr ? s.sdrProxyTex : s.inputColor);
+	auto outRes   = (ID3D11Resource*)s.nrOutputTex;
+	auto mvecRes  = ResourceFromView(s.mvSRV);
+	auto depthRes = ResourceFromView(s.depthSRV);
 
+	// Map generic Streamline keys
+	P->Set("DLSSNR.Color",  colorRes);
+	P->Set("DLSSNR.Output", outRes);
+	P->Set("DLSSNR.MVec",   mvecRes);
+	P->Set("DLSSNR.Depth",  depthRes);
+
+	// CRITICAL FIX: Map strict core NGX capability keys to prevent internal NULL pointer dereferencing
+	P->Set("Color",         colorRes);
+	P->Set("Output",        outRes);
+	P->Set("MotionVectors", mvecRes);
+	P->Set("Depth",         depthRes);
+	P->Set("MV.Scale.X",    settings.mvScaleX);
+	P->Set("MV.Scale.Y",    settings.mvScaleY);
+	P->Set("Depth.Inverted",settings.depthInverted);
+
+	CSS::CallerSpoof::Install();
 	NVSDK_NGX_Result evalRes = ((PFN_EvaluateFeature)s.pfnEvaluateFeature)(
 		ctx, s.nrFeature, P, nullptr);
+	CSS::CallerSpoof::Uninstall();
 
 	static bool s_loggedEval = false;
 	if (NVSDK_NGX_SUCCEED(evalRes) && !s_loggedEval)
