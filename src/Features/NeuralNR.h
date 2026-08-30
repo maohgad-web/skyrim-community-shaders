@@ -23,6 +23,7 @@ struct NeuralNR : public Feature
     void OnPresent();
     bool IsEnabled() { return settings.enabled; }
 
+    // Public state structure allowing CallerSpoof to inject the stolen Streamline context
     struct State
     {
         std::atomic<bool> needsReset{true};
