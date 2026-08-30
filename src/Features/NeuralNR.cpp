@@ -16,6 +16,7 @@ namespace
 {
 	constexpr int kFeatureDLSSNR = 18;
 
+	using PFN_CreateFeature   = NVSDK_NGX_Result (*)(ID3D11DeviceContext*, NVSDK_NGX_Feature, NVSDK_NGX_Parameter*, NVSDK_NGX_Handle**);
 	using PFN_EvaluateFeature = NVSDK_NGX_Result (*)(ID3D11DeviceContext*, NVSDK_NGX_Handle*, NVSDK_NGX_Parameter*, void*);
 
 	bool IsActuallyHDROutput(IDXGISwapChain* swapChain)
@@ -65,12 +66,7 @@ bool NeuralNR::CompileShaders()
 		if (FAILED(D3DCompile(src.c_str(), src.size(), file, nullptr,
 			D3D_COMPILE_STANDARD_FILE_INCLUDE, entry, "cs_5_0", 0, 0, &blob, &errorBlob)))
 		{ 
-			if (errorBlob) {
-				logger::warn("NeuralNR: D3DCompile failed for {}\nCompiler Output:\n{}", file, static_cast<const char*>(errorBlob->GetBufferPointer()));
-				errorBlob->Release();
-			} else {
-				logger::warn("NeuralNR: D3DCompile failed for {} (No error blob generated)", file); 
-			}
+			if (errorBlob) errorBlob->Release();
 			return false; 
 		}
 		
@@ -83,6 +79,27 @@ bool NeuralNR::CompileShaders()
 
 	return compile("NeuralNR_SDRProxy.hlsl", "CS_GenerateSDRProxy", &s.proxyCS)
 		&& compile("NeuralNR_Transfer.hlsl", "CS_TransferEditToHDR", &s.transferCS);
+}
+
+bool NeuralNR::CreateFeature()
+{
+	auto& s = GetState();
+	if (!s.pfnCreateFeature || !s.nrParams) return false;
+
+	// Execute feature creation directly against the target snippet DLL
+	CSS::CallerSpoof::Install();
+	NVSDK_NGX_Result res = ((PFN_CreateFeature)s.pfnCreateFeature)(
+		globals::d3d::context, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), s.nrParams, &s.nrFeature);
+	CSS::CallerSpoof::Uninstall();
+
+	if (!NVSDK_NGX_SUCCEED(res) || !s.nrFeature)
+	{
+		logger::error("NeuralNR: Snippet CreateFeature failed, res=0x{:X}", static_cast<uint32_t>(res));
+		return false;
+	}
+
+	logger::info("NeuralNR: Snippet CreateFeature Success. Tensor context established.");
+	return true;
 }
 
 void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
@@ -211,12 +228,12 @@ void NeuralNR::OnPresent()
 
 	auto& s = GetState();
 
-	// Passively wait for CallerSpoof to successfully capture the Streamline context
-	if (!s.streamlineContextCaptured || !s.nrFeature || !s.nrParams || !s.pfnEvaluateFeature) 
+	// 1. Await Streamline Context
+	if (!s.streamlineContextCaptured || !s.nrParams || !s.pfnEvaluateFeature) 
 	{
 		static uint32_t s_waitCounter = 0;
 		if (++s_waitCounter % 300 == 1)
-			logger::info("NeuralNR: Passively waiting for Streamline to inject and authorize Feature 1004...");
+			logger::info("NeuralNR: Passively waiting for Streamline to evaluate DLSS and expose the NGX parameter block...");
 		return; 
 	}
 
@@ -228,19 +245,31 @@ void NeuralNR::OnPresent()
 	if (s.w != w || s.h != h) s.needsReset = true;
 	CreateResources(w, h, dsc.Format);
 
-	// The 3D Scene Gate
+	// 2. Await 3D Scene
 	if (!s.mvSRV || !s.depthSRV) 
 	{
 		static uint32_t s_resourceWaitCounter = 0;
 		if (++s_resourceWaitCounter % 300 == 1)
-			logger::info("NeuralNR: Streamline context stolen! Waiting for active 3D scene (Depth/MVec)...");
+			logger::info("NeuralNR: Streamline context captured! Waiting for active 3D scene (Depth/MVec)...");
 		back->Release(); 
 		return; 
 	}
 
-	const bool hdr = IsActuallyHDROutput(globals::d3d::swapChain);
-	ctx->CopyResource(s.inputColor, back);
-	if (hdr) DispatchProxy();
+	// 3. Manual Snippet Feature Creation (Leveraging Stolen Parameters)
+	if (!s.nrFeature) {
+		static uint32_t s_createRetry = 0;
+		if (s_createRetry++ % 60 == 0) {
+			logger::info("NeuralNR: Establishing Neural Rendering feature context...");
+			if (!CreateFeature()) {
+				logger::warn("NeuralNR: Feature creation failed. Retrying in 1 second...");
+				back->Release();
+				return;
+			}
+		} else {
+			back->Release();
+			return;
+		}
+	}
 
 	auto* P = s.nrParams;
 	
@@ -261,6 +290,10 @@ void NeuralNR::OnPresent()
 	SetSubrect("MVec");
 	SetSubrect("Depth"); 
 	SetSubrect("Output");
+
+	const bool hdr = IsActuallyHDROutput(globals::d3d::swapChain);
+	ctx->CopyResource(s.inputColor, back);
+	if (hdr) DispatchProxy();
 
 	P->Set("DLSSNR.Hint.Render.Preset", static_cast<unsigned int>(settings.preset));
 	P->Set("DLSSNR.Enabled", 1u);
@@ -303,13 +336,16 @@ void NeuralNR::OnPresent()
 	P->Set("MV.Scale.Y",    settings.mvScaleY);
 	P->Set("Depth.Inverted",static_cast<unsigned int>(settings.depthInverted));
 
+	// 4. Feature Execution via Snippet Pipeline
+	CSS::CallerSpoof::Install();
 	NVSDK_NGX_Result evalRes = ((PFN_EvaluateFeature)s.pfnEvaluateFeature)(
 		ctx, s.nrFeature, P, nullptr);
+	CSS::CallerSpoof::Uninstall();
 
 	static bool s_loggedEval = false;
 	if (NVSDK_NGX_SUCCEED(evalRes) && !s_loggedEval)
 	{
-		logger::info("NeuralNR: Stolen Streamline context evaluated successfully! Format=0x{:X}", static_cast<uint32_t>(dsc.Format));
+		logger::info("NeuralNR: Neural Rendering frame evaluated successfully! Format=0x{:X}", static_cast<uint32_t>(dsc.Format));
 		s_loggedEval = true;
 	}
 	else if (!NVSDK_NGX_SUCCEED(evalRes))
@@ -331,11 +367,28 @@ void NeuralNR::OnPresent()
 
 void NeuralNR::PostPostLoad()
 {
+	auto& s = GetState();
+
 	if (!CompileShaders())
 	{ logger::info("NeuralNR: shader compile failed"); return; }
 
-	// Fire the memory patches immediately.
-	// This will trick Streamline into compiling the parameter block for us during engine startup.
+	// Resolve the Snippet DLL manually for isolated Creation and Evaluation
+	std::wstring snippetPath = Util::PathHelpers::GetFeatureShaderPath("NeuralNR") / L"nvngx_dlssnr.dll";
+	if (!std::filesystem::exists(snippetPath)) {
+		snippetPath = Util::PathHelpers::GetShadersPath() / L"Upscaling" / L"Streamline" / L"nvngx_dlssnr.dll";
+	}
+	
+	s.hSnippetDLL = LoadLibraryW(snippetPath.c_str());
+	if (s.hSnippetDLL) {
+		s.pfnCreateFeature = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_CreateFeature");
+		s.pfnEvaluateFeature = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
+		logger::info("NeuralNR: Snippet target located. Binding internal exports...");
+	} else {
+		logger::warn("NeuralNR: Target snippet nvngx_dlssnr.dll could not be loaded into memory.");
+		return;
+	}
+
+	// Trigger the API memory patches so Streamline will compile the parameter block
 	CSS::CallerSpoof::InstallStreamlineHooks();
 }
 

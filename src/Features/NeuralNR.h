@@ -23,15 +23,17 @@ struct NeuralNR : public Feature
     void OnPresent();
     bool IsEnabled() { return settings.enabled; }
 
-    // Public state for CallerSpoof to inject the stolen Streamline context
     struct State
     {
         std::atomic<bool> needsReset{true};
         bool streamlineContextCaptured = false; 
         
+        HMODULE hSnippetDLL = nullptr;
+        
         NVSDK_NGX_Handle* nrFeature = nullptr;
         NVSDK_NGX_Parameter* nrParams = nullptr;
         
+        void* pfnCreateFeature = nullptr;
         void* pfnEvaluateFeature = nullptr;
 
         ID3D11Texture2D* inputColor = nullptr;
@@ -67,6 +69,7 @@ private:
         float paperWhiteNits = 203.0f, encodeStrength = 1.0f;
     } settings;
 
+    bool CreateFeature();
     bool CompileShaders();
     void CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt);
     void ReleaseResources();

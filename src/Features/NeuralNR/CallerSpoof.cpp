@@ -7,8 +7,7 @@
 
 namespace CSS::CallerSpoof
 {
-	// --- Streamline Interception Definitions ---
-	enum slFeature : uint32_t { kFeatureDLSS_NR = 1004 }; // Target ID from DLSS-NR Guide Section 2
+	enum slFeature : uint32_t { kFeatureDLSS_NR = 1004 }; 
 	
 	struct slPreferences {
 		bool showConsole;
@@ -30,27 +29,21 @@ namespace CSS::CallerSpoof
 	using PFN_EvaluateFeature = NVSDK_NGX_Result (*)(ID3D11DeviceContext*, NVSDK_NGX_Handle*, NVSDK_NGX_Parameter*, void*);
 	static PFN_EvaluateFeature s_orig_NGXEvaluate = nullptr;
 
-	// --- 1. The Context Steal ---
-	// Intercepts Streamline's underlying NGX evaluation call to physically steal the pre-validated memory blocks.
 	static NVSDK_NGX_Result Hooked_NGXEvaluate(ID3D11DeviceContext* ctx, NVSDK_NGX_Handle* feat, NVSDK_NGX_Parameter* param, void* info)
 	{
 		auto& s = NeuralNR::GetState();
 		
-		if (!s.streamlineContextCaptured && feat && param)
+		// Steal ONLY the parameter block, NOT the handle (which belongs to DLSS-SR).
+		if (!s.streamlineContextCaptured && param)
 		{
-			logger::info("NeuralNR [Streamline]: Pipeline intercepted! Stealing NGX_Handle and NGX_Parameter blocks.");
-			s.nrFeature = feat;
+			logger::info("NeuralNR [Streamline]: DLSS pipeline intercepted! Stealing globally validated NGX_Parameter block.");
 			s.nrParams = param;
-			s.pfnEvaluateFeature = (void*)s_orig_NGXEvaluate;
 			s.streamlineContextCaptured = true;
 		}
 
-		// Forward execution to the real NGX evaluator
 		return s_orig_NGXEvaluate(ctx, feat, param, info);
 	}
 
-	// --- 2. The Plugin Array Injection ---
-	// Intercepts Streamline initialization to force DLSS-NR (1004) into the load manifest.
 	int Hooked_slInit(const slPreferences* pref, void* app, void* device)
 	{
 		logger::info("NeuralNR [Streamline]: Intercepted slInit. Modifying plugin array...");
@@ -76,17 +69,12 @@ namespace CSS::CallerSpoof
 		return s_orig_slInit(&modPref, app, device);
 	}
 
-	// --- 3. The Memory Gate Patch ---
-	// Bypasses the "dlss_nr_0" missing error in Streamline's OTA manifest check.
 	int Hooked_slIsFeatureSupported(slFeature feature, const void* pArch)
 	{
-		if (feature == kFeatureDLSS_NR) {
-			return 0; // eResultSuccess - Overrides the plugin disable gate
-		}
+		if (feature == kFeatureDLSS_NR) return 0; 
 		return s_orig_slIsFeatureSupported(feature, pArch);
 	}
 
-	// --- IAT Patching Engine ---
 	static void PatchModuleIATAny(HMODULE hTargetModule, const char* targetFunction, void* hookFunc, void** origFunc)
 	{
 		if (!hTargetModule) return;
@@ -132,23 +120,20 @@ namespace CSS::CallerSpoof
 
 	void InstallStreamlineHooks()
 	{
-		// Locate the module actively loading the Streamline API (usually the host application or Upscaler plugin)
 		HMODULE hUpscaler = GetModuleHandleW(L"SkyrimUpscaler.dll"); 
 		if (!hUpscaler) hUpscaler = GetModuleHandleW(L"FSR2.dll");
-		if (!hUpscaler) hUpscaler = GetModuleHandleW(NULL); // Fallback to host process
+		if (!hUpscaler) hUpscaler = GetModuleHandleW(NULL); 
 		
-		// 1. Inject feature ID 1004 & clear the memory gate
 		PatchModuleIATAny(hUpscaler, "slInit", (void*)Hooked_slInit, (void**)&s_orig_slInit);
 		PatchModuleIATAny(hUpscaler, "slIsFeatureSupported", (void*)Hooked_slIsFeatureSupported, (void**)&s_orig_slIsFeatureSupported);
 
-		// 2. Locate Streamline's active feature interface
-		HMODULE hStreamline = GetModuleHandleW(L"sl.dlss_nr.dll");
-		if (!hStreamline) hStreamline = GetModuleHandleW(L"sl.interposer.dll");
+		// Hook the active interposer pipeline to catch the DLSS-SR evaluation command
+		HMODULE hInterposer = GetModuleHandleW(L"sl.interposer.dll");
+		if (!hInterposer) hInterposer = GetModuleHandleW(L"sl.dlss.dll");
 
-		if (hStreamline) {
-			// 3. Plant the payload on Streamline's underlying NGX evaluation call to steal the validated context
-			PatchModuleIATAny(hStreamline, "NVSDK_NGX_D3D11_EvaluateFeature", (void*)Hooked_NGXEvaluate, (void**)&s_orig_NGXEvaluate);
-			logger::info("NeuralNR: Streamline IAT hooks installed successfully. Ready to intercept.");
+		if (hInterposer) {
+			PatchModuleIATAny(hInterposer, "NVSDK_NGX_D3D11_EvaluateFeature", (void*)Hooked_NGXEvaluate, (void**)&s_orig_NGXEvaluate);
+			logger::info("NeuralNR: Streamline IAT hooks installed successfully. Ready to intercept DLSS execution.");
 		} else {
 			logger::warn("NeuralNR: Streamline plugins not found in memory. IAT payload steal deferred.");
 		}
