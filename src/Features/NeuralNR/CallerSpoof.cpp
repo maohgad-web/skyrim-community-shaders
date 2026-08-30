@@ -4,6 +4,7 @@
 #include "Globals.h"
 #include <windows.h>
 #include <vector>
+#include <thread>
 
 namespace CSS::CallerSpoof
 {
@@ -60,16 +61,15 @@ namespace CSS::CallerSpoof
 		return 0;
 	}
 
-	// --- Active Interceptor: Feature Gate Steal ---
+	// --- The Direct Parameter Steal ---
 	static NVSDK_NGX_Result Hooked_NGXCreate(ID3D11DeviceContext* ctx, NVSDK_NGX_Feature feat, NVSDK_NGX_Parameter* param, NVSDK_NGX_Handle** handle)
 	{
 		auto& s = NeuralNR::GetState();
 		
-		// Gate the steal exactly as you suggested: Target SuperSampling (Feature ID 1)
-		// Streamline validates this block for DLSS-SR. We steal it to use for DLSS-NR.
+		// Target SuperSampling (Feature 1) to steal Streamline's globally validated NGX_Parameter block
 		if (!s.streamlineContextCaptured && param && feat == NVSDK_NGX_Feature_SuperSampling)
 		{
-			logger::info("NeuralNR [Streamline]: Captured globally validated NGX_Parameter block from DLSS-SR (Feature 1) Create event.");
+			logger::info("NeuralNR [Streamline]: Pipeline intercepted! Captured globally validated NGX_Parameter block from DLSS-SR (Feature 1).");
 			s.nrParams = param;
 			s.streamlineContextCaptured = true;
 		}
@@ -80,36 +80,8 @@ namespace CSS::CallerSpoof
 
 	static NVSDK_NGX_Result Hooked_NGXEvaluate(ID3D11DeviceContext* ctx, NVSDK_NGX_Handle* feat, NVSDK_NGX_Parameter* param, void* info)
 	{
-		// Passive observer just to maintain the pipeline execution flow
-		if (s_orig_NGXEvaluate) {
-			return s_orig_NGXEvaluate(ctx, feat, param, info);
-		}
+		if (s_orig_NGXEvaluate) return s_orig_NGXEvaluate(ctx, feat, param, info);
 		return static_cast<NVSDK_NGX_Result>(0xBAD00007);
-	}
-
-	// --- IAT Evasion Bypass: Hook GetProcAddress ---
-	static FARPROC WINAPI Hooked_GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
-	{
-		if (lpProcName && ((ULONG_PTR)lpProcName > 0xFFFF))
-		{
-			if (_stricmp(lpProcName, "NVSDK_NGX_D3D11_CreateFeature") == 0)
-			{
-				if (!s_orig_NGXCreate) {
-					s_orig_NGXCreate = (PFN_CreateFeature)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
-				}
-				return (FARPROC)Hooked_NGXCreate;
-			}
-			if (_stricmp(lpProcName, "NVSDK_NGX_D3D11_EvaluateFeature") == 0)
-			{
-				if (!s_orig_NGXEvaluate) {
-					s_orig_NGXEvaluate = (PFN_EvaluateFeature)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
-				}
-				return (FARPROC)Hooked_NGXEvaluate;
-			}
-		}
-		
-		if (s_origGetProcAddress) return s_origGetProcAddress(hModule, lpProcName);
-		return ::GetProcAddress(hModule, lpProcName);
 	}
 
 	int Hooked_slInit(const slPreferences* pref, void* app, void* device)
@@ -139,27 +111,51 @@ namespace CSS::CallerSpoof
 
 	int Hooked_slIsFeatureSupported(slFeature feature, const void* pArch)
 	{
-		if (feature == kFeatureDLSS_NR) {
-			return 0; // Force supported response
-		}
+		if (feature == kFeatureDLSS_NR) return 0; 
 		return s_orig_slIsFeatureSupported(feature, pArch);
 	}
 
-	static bool PatchModuleIATAny(HMODULE hTargetModule, const char* targetFunction, void* hookFunc, void** origFunc)
+	// --- Aggressive GetProcAddress Hijack ---
+	static FARPROC WINAPI Hooked_GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
 	{
-		if (!hTargetModule) return false;
+		if (lpProcName && ((ULONG_PTR)lpProcName > 0xFFFF))
+		{
+			if (_stricmp(lpProcName, "slInit") == 0) {
+				if (!s_orig_slInit) s_orig_slInit = (slInit_t)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
+				return (FARPROC)Hooked_slInit;
+			}
+			if (_stricmp(lpProcName, "slIsFeatureSupported") == 0) {
+				if (!s_orig_slIsFeatureSupported) s_orig_slIsFeatureSupported = (slIsFeatureSupported_t)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
+				return (FARPROC)Hooked_slIsFeatureSupported;
+			}
+			if (_stricmp(lpProcName, "NVSDK_NGX_D3D11_CreateFeature") == 0) {
+				if (!s_orig_NGXCreate) s_orig_NGXCreate = (PFN_CreateFeature)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
+				return (FARPROC)Hooked_NGXCreate;
+			}
+			if (_stricmp(lpProcName, "NVSDK_NGX_D3D11_EvaluateFeature") == 0) {
+				if (!s_orig_NGXEvaluate) s_orig_NGXEvaluate = (PFN_EvaluateFeature)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
+				return (FARPROC)Hooked_NGXEvaluate;
+			}
+		}
+		
+		if (s_origGetProcAddress) return s_origGetProcAddress(hModule, lpProcName);
+		return ::GetProcAddress(hModule, lpProcName);
+	}
+
+	static void PatchModuleIATAny(HMODULE hTargetModule, const char* targetFunction, void* hookFunc, void** origFunc)
+	{
+		if (!hTargetModule) return;
 
 		PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)hTargetModule;
-		if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return false;
+		if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return;
 
 		PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((BYTE*)hTargetModule + dosHeader->e_lfanew);
-		if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return false;
+		if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return;
 
 		DWORD importDirRVA = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-		if (!importDirRVA) return false;
+		if (!importDirRVA) return;
 
 		PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)((BYTE*)hTargetModule + importDirRVA);
-		bool patched = false;
 
 		while (importDesc->Name)
 		{
@@ -179,7 +175,6 @@ namespace CSS::CallerSpoof
 							if (origFunc && !*origFunc) *origFunc = (void*)firstThunk->u1.Function;
 							firstThunk->u1.Function = (uintptr_t)hookFunc;
 							VirtualProtect(&firstThunk->u1.Function, sizeof(uintptr_t), oldProtect, &oldProtect);
-							patched = true;
 						}
 					}
 				}
@@ -188,41 +183,36 @@ namespace CSS::CallerSpoof
 			}
 			importDesc++;
 		}
-		return patched;
 	}
 
-	void InstallUpscalerHooks()
+	static void StreamlineHookThread()
 	{
-		HMODULE hUpscaler = GetModuleHandleW(L"SkyrimUpscaler.dll"); 
-		if (!hUpscaler) hUpscaler = GetModuleHandleW(L"FSR2.dll");
-		if (!hUpscaler) hUpscaler = GetModuleHandleW(NULL); 
+		HMODULE hUpscaler = nullptr;
+		while (!(hUpscaler = GetModuleHandleW(L"SkyrimUpscaler.dll")) && !(hUpscaler = GetModuleHandleW(L"FSR2.dll"))) {
+			Sleep(10);
+		}
+		PatchModuleIATAny(hUpscaler, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
+		logger::info("NeuralNR [Diag]: Successfully attached GetProcAddress hijack to Upscaler plugin.");
+
+		HMODULE hInterposer = nullptr;
+		while (!(hInterposer = GetModuleHandleW(L"sl.interposer.dll"))) {
+			Sleep(10);
+		}
+		PatchModuleIATAny(hInterposer, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
+		logger::info("NeuralNR [Diag]: Successfully attached GetProcAddress hijack to sl.interposer.dll.");
 		
-		PatchModuleIATAny(hUpscaler, "slInit", (void*)Hooked_slInit, (void**)&s_orig_slInit);
-		PatchModuleIATAny(hUpscaler, "slIsFeatureSupported", (void*)Hooked_slIsFeatureSupported, (void**)&s_orig_slIsFeatureSupported);
+		HMODULE hDLSS = nullptr;
+		while (!(hDLSS = GetModuleHandleW(L"sl.dlss.dll"))) {
+			Sleep(10);
+		}
+		PatchModuleIATAny(hDLSS, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
+		logger::info("NeuralNR [Diag]: Successfully attached GetProcAddress hijack to sl.dlss.dll.");
 	}
 
-	bool InstallActiveInterceptors()
+	void InstallStreamlineHooks()
 	{
-		static bool s_interposerHooked = false;
-		static bool s_dlssHooked = false;
-
-		HMODULE hInterposer = GetModuleHandleW(L"sl.interposer.dll");
-		HMODULE hDLSS       = GetModuleHandleW(L"sl.dlss.dll");
-
-		// Target GetProcAddress to intercept Streamline's dynamic function resolution
-		if (hInterposer && !s_interposerHooked) {
-			bool p1 = PatchModuleIATAny(hInterposer, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
-			logger::info("NeuralNR [Diag]: Hooked sl.interposer.dll GetProcAddress={}", p1);
-			s_interposerHooked = true;
-		}
-
-		if (hDLSS && !s_dlssHooked) {
-			bool p1 = PatchModuleIATAny(hDLSS, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
-			logger::info("NeuralNR [Diag]: Hooked sl.dlss.dll GetProcAddress={}", p1);
-			s_dlssHooked = true;
-		}
-
-		return (s_interposerHooked || s_dlssHooked);
+		// Spawn aggressive background polling thread immediately
+		std::thread(StreamlineHookThread).detach();
 	}
 
 	void Install()
@@ -242,4 +232,7 @@ namespace CSS::CallerSpoof
 	}
 
 	void Uninstall() {}
+
+	// Execute background poll at DLL load time
+	static struct AutoInit { AutoInit() { InstallStreamlineHooks(); } } s_autoInit;
 }
