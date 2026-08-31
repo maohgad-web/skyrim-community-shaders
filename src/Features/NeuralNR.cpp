@@ -114,6 +114,73 @@ namespace
 			return false;
 		}
 	}
+
+	using PFN_GetCapabilityParameters = NVSDK_NGX_Result (*)(NVSDK_NGX_Parameter**);
+
+	// PATCH: isolated so __try/__except is valid here, matching every other
+	// Safe* helper in this file.
+	bool SafeGetCapabilityParameters(void* pfnGetCapParams, NVSDK_NGX_Parameter** outParams, NVSDK_NGX_Result* outResult)
+	{
+		__try
+		{
+			*outResult = ((PFN_GetCapabilityParameters)pfnGetCapParams)(outParams);
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return false;
+		}
+	}
+
+	// PATCH: actively calls GetCapabilityParameters ourselves, resolved
+	// directly from _nvngx.dll, instead of passively waiting to intercept
+	// someone else's call to it. Confirmed via the per-target import scan
+	// that no tracked module statically imports this name, and confirmed
+	// via the log that nobody dynamically resolves it through GetProcAddress
+	// either -- Streamline evidently manages its own parameters through an
+	// internal layer that never touches this raw NGX entry point, so
+	// passive interception was never going to catch it. The instance check
+	// already confirmed our own loaded snippet is the same live core
+	// instance, so calling this ourselves through that same confirmed-real
+	// module should be valid. Uses GetModuleHandleW (find already-loaded),
+	// never LoadLibraryW -- the same lesson from the earlier LoadDLL
+	// timing investigation: the real core only becomes findable once
+	// Streamline has loaded it via its own driver-store-aware mechanism.
+	void TryCaptureCapabilityParametersDirectly()
+	{
+		auto& s = NeuralNR::GetState();
+		if (s.capabilityParamsCaptured) return;
+
+		HMODULE hCore = GetModuleHandleW(L"_nvngx.dll");
+		if (!hCore) return;
+
+		auto pfnGetCapParams = GetProcAddress(hCore, "NVSDK_NGX_D3D11_GetCapabilityParameters");
+		if (!pfnGetCapParams) return;
+
+		CSS::CallerSpoof::Install();
+		NVSDK_NGX_Parameter* outParams = nullptr;
+		NVSDK_NGX_Result res = static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
+		bool survived = SafeGetCapabilityParameters((void*)pfnGetCapParams, &outParams, &res);
+		CSS::CallerSpoof::Uninstall();
+
+		if (!survived)
+		{
+			logger::warn("NeuralNR: SEH caught access violation calling GetCapabilityParameters directly.");
+			return;
+		}
+
+		if (!NVSDK_NGX_SUCCEED(res) || !outParams)
+		{
+			static uint32_t s_failLogCounter = 0;
+			if (++s_failLogCounter % 300 == 1)
+				logger::warn("NeuralNR: Direct GetCapabilityParameters call failed, res=0x{:X}", static_cast<uint32_t>(res));
+			return;
+		}
+
+		logger::info("NeuralNR: Direct GetCapabilityParameters call succeeded: {}", (void*)outParams);
+		s.capabilityParams = outParams;
+		s.capabilityParamsCaptured = true;
+	}
 }
 
 ID3D11Resource* NeuralNR::ResourceFromView(ID3D11View* view) const
@@ -363,6 +430,12 @@ void NeuralNR::OnPresent()
 	// succeeds once.
 	if (!s.proxyCS || !s.transferCS)
 		CompileShaders();
+
+	// PATCH: actively try capturing GetCapabilityParameters ourselves each
+	// frame until it succeeds once -- see TryCaptureCapabilityParametersDirectly
+	// for why passive interception was abandoned for this specific source.
+	if (!s.capabilityParamsCaptured)
+		TryCaptureCapabilityParametersDirectly();
 
 	// 2. Await parameter capture from active DLSS execution (or after toggling DLSS in menu)
 	if (!s.streamlineContextCaptured || !s.nrParams || !s.pfnEvaluateFeature || !s.pfnCreateFeature) 
