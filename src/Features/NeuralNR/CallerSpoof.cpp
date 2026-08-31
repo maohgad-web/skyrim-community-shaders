@@ -7,7 +7,7 @@
 #include <vector>
 #include <atomic>
 #include <string>
-#include <detours.h>
+#include <detours/detours.h>
 
 namespace CSS::CallerSpoof
 {
@@ -376,10 +376,8 @@ namespace CSS::CallerSpoof
 	// confirmed as the cause of any specific observed crash.
 	static std::atomic<bool> s_hookedStatus[std::size(s_targetModules)] = {};
 
-	// PATCH: extracted so both the poll-based path below AND the new
-	// instant-hook path (Hooked_LoadLibraryW etc., further down) can apply
-	// the exact same patching logic to a module the moment either mechanism
-	// discovers it — no duplicated logic between the two.
+	// Extracted into its own function so the patching logic lives in one
+	// place, called from InstallActiveInterceptors below.
 	static void PatchTargetModuleAndMarkHooked(HMODULE hMod, size_t idx)
 	{
 		PatchModuleIATAny(hMod, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
@@ -440,21 +438,24 @@ namespace CSS::CallerSpoof
 	}
 
 	// --- Instant-hook on module load, via Detours, as a lower-latency
-	// alternative to polling. Detours is already a project dependency (used
-	// elsewhere in Community Shaders), so no new build-system work is needed.
-	// Deliberately scoped to LoadLibrary* only — NOT GetProcAddress, which is
-	// a much hotter, much more heavily-targeted function in a crowded
-	// modding ecosystem (SKSE plugins, ENB, ReShade, possibly other Community
-	// Shaders features) where a second, unrelated inline hook on the same
-	// function's prologue bytes is a real collision risk. LoadLibrary* is
-	// called far less often, making that collision risk much smaller, and
-	// directly closes the actual gap observed in testing: modules load, then
-	// sit undetected until the next 200ms poll tick — sometimes several
-	// seconds late. This patches a matching module the instant it loads
-	// instead. InstallActiveInterceptors() keeps running in parallel
-	// regardless, as the deliberate fallback: if this hook fails to install,
-	// or a target module was already loaded before this installed at all,
-	// the poll still eventually catches it.
+	// alternative to polling. Confirmed available and correctly wired for
+	// this exact target via CMakeLists.txt's find_path(DETOURS_INCLUDE_DIRS
+	// "detours/detours.h") + target_include_directories/target_link_libraries
+	// on ${PROJECT_NAME} — the earlier compile failure was solely the wrong
+	// include path (detours.h instead of detours/detours.h), not a missing
+	// or unwired dependency. Deliberately scoped to LoadLibrary* only — NOT
+	// GetProcAddress, which is a much hotter, much more heavily-targeted
+	// function in a crowded modding ecosystem (SKSE plugins, ENB, ReShade,
+	// possibly other Community Shaders features) where a second, unrelated
+	// inline hook on the same function's prologue bytes is a real collision
+	// risk. LoadLibrary* is called far less often, making that collision
+	// risk much smaller, and directly closes the actual gap observed in
+	// testing: modules load, then sit undetected until the next 200ms poll
+	// tick — sometimes several seconds late. This patches a matching module
+	// the instant it loads instead. InstallActiveInterceptors() keeps
+	// running in parallel regardless, as the deliberate fallback: if this
+	// hook fails to install, or a target module was already loaded before
+	// this installed at all, the poll still eventually catches it.
 	using PFN_LoadLibraryW   = HMODULE(WINAPI*)(LPCWSTR);
 	using PFN_LoadLibraryA   = HMODULE(WINAPI*)(LPCSTR);
 	using PFN_LoadLibraryExW = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
