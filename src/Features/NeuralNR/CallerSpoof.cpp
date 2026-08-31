@@ -17,9 +17,6 @@ namespace CSS::CallerSpoof
 	using PFN_EvaluateFeature = NVSDK_NGX_Result (*)(ID3D11DeviceContext*, NVSDK_NGX_Handle*, NVSDK_NGX_Parameter*, void*);
 	static PFN_EvaluateFeature s_orig_NGXEvaluate = nullptr;
 
-	using PFN_slOnPluginLoad = void* (*)(void*);
-	static PFN_slOnPluginLoad s_orig_slOnPluginLoad = nullptr;
-
 	using GetProcAddress_t = FARPROC(WINAPI*)(HMODULE, LPCSTR);
 	static GetProcAddress_t s_origGetProcAddress = nullptr;
 
@@ -63,7 +60,7 @@ namespace CSS::CallerSpoof
 				logger::info("NeuralNR [Streamline]: Confirmed Feature 18 (Neural Rendering) — stealing NGX_Parameter block: {}", (void*)param);
 				s.nrParams = param;
 				s.streamlineContextCaptured = true;
-                s.paramsAreBorrowed = false;
+				s.paramsAreBorrowed = false;
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {}
 		}
@@ -101,6 +98,16 @@ namespace CSS::CallerSpoof
 				s.streamlineContextCaptured = true;
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {}
+		}
+
+		// Suppress native Streamline evaluation for NR to avoid D3D11 race conditions
+		if (isConfirmedNR)
+		{
+			static uint32_t s_suppressLog = 0;
+			if (s_suppressLog++ % 300 == 0) {
+				logger::info("NeuralNR [Streamline]: Suppressing native Streamline EvaluateFeature for NR to prevent D3D11 race condition.");
+			}
+			return NVSDK_NGX_Result_Success;
 		}
 
 		if (s_orig_NGXEvaluate) {
@@ -373,8 +380,11 @@ namespace CSS::CallerSpoof
 			size_t idx = 0;
 			if (hLoaded && FindTargetModuleIndex(fileName, &idx) && !s_hookedStatus[idx].load())
 			{
-				// FIXED: Removed fileName parameter to prevent fmt from rejecting wide-string pointer formatting
-				logger::info("NeuralNR [Diag]: Instant-hook caught a target module load via LoadLibrary.");
+				char logName[64];
+				size_t converted = 0;
+				wcstombs_s(&converted, logName, sizeof(logName), fileName, _TRUNCATE);
+				logger::info("NeuralNR [Diag]: Instant-hook caught target module load: {}", logName);
+
 				PatchTargetModuleAndMarkHooked(hLoaded, idx);
 
 				// Hybrid Detours Strategy for Streamline
