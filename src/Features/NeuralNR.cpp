@@ -417,6 +417,12 @@ void NeuralNR::OnPresent()
 
 void NeuralNR::PostPostLoad()
 {
+	// PATCH: diagnostic — confirms whether this function is even being
+	// invoked by SKSE's messaging system at all, independent of anything
+	// downstream. Placed before GetState()/CompileShaders() so nothing in
+	// this function's own logic can swallow it before it fires.
+	logger::info("NeuralNR: PostPostLoad entered.");
+
 	auto& s = GetState();
 
 	if (!CompileShaders())
