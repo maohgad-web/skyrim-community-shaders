@@ -102,6 +102,10 @@ namespace CSS::CallerSpoof
 				logger::info("NeuralNR [Diag]: Feature 18 not observed — borrowing live Feature 1 (SuperSampling) NGX_Parameter block as a wide-net fallback: {}", (void*)param);
 				s.nrParams = param;
 				s.streamlineContextCaptured = true;
+				// PATCH: marks this as the borrowed path so NeuralNR.cpp's own
+				// diagnostic logs can state which source supplied nrParams,
+				// without needing to cross-reference this separate log stream.
+				s.paramsAreBorrowed = true;
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
 				logger::warn("NeuralNR [Diag]: SEH caught access violation during SuperSampling parameter borrow.");

@@ -133,11 +133,11 @@ bool NeuralNR::CreateFeature()
 
 	if (!NVSDK_NGX_SUCCEED(res) || !s.nrFeature)
 	{
-		logger::error("NeuralNR: Snippet CreateFeature failed, res=0x{:X}", static_cast<uint32_t>(res));
+		logger::error("NeuralNR: Snippet CreateFeature failed, res=0x{:X} (paramsAreBorrowed={})", static_cast<uint32_t>(res), s.paramsAreBorrowed);
 		return false;
 	}
 
-	logger::info("NeuralNR: Snippet CreateFeature Success. Tensor context established.");
+	logger::info("NeuralNR: Snippet CreateFeature Success. Tensor context established. (paramsAreBorrowed={})", s.paramsAreBorrowed);
 	return true;
 }
 
@@ -279,8 +279,8 @@ void NeuralNR::OnPresent()
 		// separate log stream.
 		static uint32_t s_waitCounter = 0;
 		if (++s_waitCounter % 300 == 1)
-			logger::info("NeuralNR: Waiting — streamlineContextCaptured={}, nrParams={}, pfnEvaluateFeature={}, pfnCreateFeature={}",
-				s.streamlineContextCaptured, (void*)s.nrParams, s.pfnEvaluateFeature != nullptr, s.pfnCreateFeature != nullptr);
+			logger::info("NeuralNR: Waiting — streamlineContextCaptured={}, nrParams={}, pfnEvaluateFeature={}, pfnCreateFeature={}, paramsAreBorrowed={}",
+				s.streamlineContextCaptured, (void*)s.nrParams, s.pfnEvaluateFeature != nullptr, s.pfnCreateFeature != nullptr, s.paramsAreBorrowed);
 		return; 
 	}
 
@@ -395,7 +395,7 @@ void NeuralNR::OnPresent()
 	static bool s_loggedEval = false;
 	if (NVSDK_NGX_SUCCEED(evalRes) && !s_loggedEval)
 	{
-		logger::info("NeuralNR: Neural Rendering frame evaluated successfully! Format=0x{:X}", static_cast<uint32_t>(dsc.Format));
+		logger::info("NeuralNR: Neural Rendering frame evaluated successfully! Format=0x{:X} (paramsAreBorrowed={})", static_cast<uint32_t>(dsc.Format), s.paramsAreBorrowed);
 		s_loggedEval = true;
 	}
 	else if (!NVSDK_NGX_SUCCEED(evalRes))
@@ -404,7 +404,7 @@ void NeuralNR::OnPresent()
 		static uint32_t s_failureLogFrameCounter = 0;
 		if (evalRes != s_lastLoggedFailure || ++s_failureLogFrameCounter >= 300)
 		{
-			logger::warn("NeuralNR: EvaluateFeature failed, res=0x{:X}", static_cast<uint32_t>(evalRes));
+			logger::warn("NeuralNR: EvaluateFeature failed, res=0x{:X} (paramsAreBorrowed={})", static_cast<uint32_t>(evalRes), s.paramsAreBorrowed);
 			s_lastLoggedFailure = evalRes;
 			s_failureLogFrameCounter = 0;
 		}

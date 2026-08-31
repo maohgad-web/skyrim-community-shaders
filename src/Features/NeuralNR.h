@@ -27,6 +27,12 @@ struct NeuralNR : public Feature
     {
         std::atomic<bool> needsReset{true};
         bool streamlineContextCaptured = false; 
+        // PATCH: set by CallerSpoof.cpp's Hooked_NGXCreate specifically when
+        // the SuperSampling (Feature 1) fallback fires instead of confirmed
+        // Feature 18 -- lets every downstream log line here state which
+        // source actually supplied nrParams, instead of needing to
+        // cross-reference CallerSpoof's separate log stream by timestamp.
+        bool paramsAreBorrowed = false;
         
         HMODULE hSnippetDLL = nullptr;
         
