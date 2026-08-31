@@ -57,6 +57,48 @@ namespace
 			return false;
 		}
 	}
+
+	// PATCH: isolated so __try/__except is valid here -- CompileShaders'
+	// own compile lambda has std::ifstream/stringstream/string objects in
+	// its scope, which can't coexist with __try in the same function under
+	// MSVC (same constraint already applied throughout CallerSpoof.cpp).
+	// Defense-in-depth: the null-device check in CompileShaders should
+	// prevent this from ever faulting, but nothing upstream (Feature.h's
+	// ForEachLoadedFeature loop has zero exception handling) catches a
+	// fault here if some other unexpected state causes one.
+	bool SafeCreateComputeShader(ID3DBlob* blob, ID3D11ComputeShader** out)
+	{
+		__try
+		{
+			HRESULT hr = globals::d3d::device->CreateComputeShader(
+				blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, out);
+			return SUCCEEDED(hr) && *out;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return false;
+		}
+	}
+
+	// PATCH: closes the one remaining unguarded call in CompileShaders --
+	// D3DCompile itself doesn't need the D3D device (it's a standalone
+	// HLSL-to-bytecode compiler), so it wasn't a suspect under the
+	// null-device hypothesis, but leaving it unguarded meant a fault here
+	// specifically would still produce zero log output, undermining the
+	// "CompileShaders always logs something" guarantee this diagnostic
+	// relies on. Isolated for the same __try/C2712 reason as the others.
+	bool SafeD3DCompile(const char* src, size_t srcSize, const char* fileName, const char* entryPoint, ID3DBlob** outBlob, ID3DBlob** outErrorBlob)
+	{
+		__try
+		{
+			return SUCCEEDED(D3DCompile(src, srcSize, fileName, nullptr,
+				D3D_COMPILE_STANDARD_FILE_INCLUDE, entryPoint, "cs_5_0", 0, 0, outBlob, outErrorBlob));
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return false;
+		}
+	}
 }
 
 ID3D11Resource* NeuralNR::ResourceFromView(ID3D11View* view) const
@@ -71,6 +113,21 @@ ID3D11Resource* NeuralNR::ResourceFromView(ID3D11View* view) const
 bool NeuralNR::CompileShaders()
 {
 	auto& s = GetState();
+
+	// PATCH: kPostPostLoad (this function's only caller, via PostPostLoad)
+	// fires before the game has rendered a single frame -- globals::d3d::
+	// device is only populated later, once the first real Present call is
+	// intercepted. Dereferencing it here when still null is a structured
+	// exception, not a C++ one, and Feature.h's ForEachLoadedFeature loop
+	// has zero exception handling around its callback -- nothing upstream
+	// would catch it. Return cleanly so the caller can retry later (see
+	// OnPresent) once the device actually exists, instead of faulting.
+	if (!globals::d3d::device)
+	{
+		logger::info("NeuralNR: CompileShaders deferred -- D3D device not yet available.");
+		return false;
+	}
+
 	auto dir = Util::PathHelpers::GetShadersPath();
 
 	auto compile = [&](const char* file, const char* entry, ID3D11ComputeShader** out) {
@@ -83,18 +140,19 @@ bool NeuralNR::CompileShaders()
 		ID3DBlob* blob = nullptr;
 		ID3DBlob* errorBlob = nullptr;
 		
-		if (FAILED(D3DCompile(src.c_str(), src.size(), file, nullptr,
-			D3D_COMPILE_STANDARD_FILE_INCLUDE, entry, "cs_5_0", 0, 0, &blob, &errorBlob)))
+		if (!SafeD3DCompile(src.c_str(), src.size(), file, entry, &blob, &errorBlob))
 		{ 
+			logger::warn("NeuralNR: D3DCompile failed or faulted for {}", file);
 			if (errorBlob) errorBlob->Release();
 			return false; 
 		}
 		
-		auto hr = globals::d3d::device->CreateComputeShader(
-			blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, out);
-			
+		bool ok = SafeCreateComputeShader(blob, out);
+		if (!ok)
+			logger::warn("NeuralNR: CreateComputeShader failed or faulted for {}", file);
+
 		blob->Release();
-		return SUCCEEDED(hr) && *out;
+		return ok;
 	};
 
 	return compile("NeuralNR_SDRProxy.hlsl", "CS_GenerateSDRProxy", &s.proxyCS)
@@ -270,6 +328,14 @@ void NeuralNR::OnPresent()
 	// 1. Dynamic Interceptor Poll: continuously ensures IAT hooks are attached
 	CSS::CallerSpoof::InstallActiveInterceptors();
 
+	// PATCH: lazy retry for shader compilation deferred in PostPostLoad
+	// (D3D device wasn't available that early). By the time OnPresent runs
+	// at all, a real Present call has occurred, so the device is
+	// guaranteed valid here -- safe to retry unconditionally until it
+	// succeeds once.
+	if (!s.proxyCS || !s.transferCS)
+		CompileShaders();
+
 	// 2. Await parameter capture from active DLSS execution (or after toggling DLSS in menu)
 	if (!s.streamlineContextCaptured || !s.nrParams || !s.pfnEvaluateFeature || !s.pfnCreateFeature) 
 	{
@@ -417,16 +483,26 @@ void NeuralNR::OnPresent()
 
 void NeuralNR::PostPostLoad()
 {
-	// PATCH: diagnostic — confirms whether this function is even being
-	// invoked by SKSE's messaging system at all, independent of anything
-	// downstream. Placed before GetState()/CompileShaders() so nothing in
-	// this function's own logic can swallow it before it fires.
+	// Diagnostic — confirms whether this function is even being invoked by
+	// SKSE's messaging system at all, independent of anything downstream.
+	// Placed before GetState()/CompileShaders() so nothing in this
+	// function's own logic can swallow it before it fires.
 	logger::info("NeuralNR: PostPostLoad entered.");
 
 	auto& s = GetState();
 
+	// PATCH: CompileShaders() needs the D3D device, which this early in
+	// the lifecycle may not exist yet (see CompileShaders' own guard).
+	// Previously a failure here returned out of PostPostLoad entirely,
+	// blocking the snippet load and the Detours ambush below -- neither of
+	// which depends on the device at all, and the ambush specifically
+	// benefits from installing as early as possible (it's what lets it
+	// catch Streamline's own resolution before Streamline itself boots).
+	// Attempt shader compilation, but don't let a deferred failure here
+	// block anything else -- it retries lazily from OnPresent() once the
+	// device exists.
 	if (!CompileShaders())
-	{ logger::info("NeuralNR: shader compile failed"); return; }
+		logger::info("NeuralNR: shader compile deferred or failed; will retry from OnPresent.");
 
 	std::wstring snippetPath = Util::PathHelpers::GetFeatureShaderPath("NeuralNR") / L"nvngx_dlssnr.dll";
 	if (!std::filesystem::exists(snippetPath)) {
@@ -439,8 +515,10 @@ void NeuralNR::PostPostLoad()
 		s.pfnEvaluateFeature = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
 		logger::info("NeuralNR: Target snippet loaded. Exports resolved.");
 	} else {
+		// PATCH: no longer returns here -- the Detours ambush below is
+		// fully independent of whether our own direct snippet load
+		// succeeded, so an unrelated failure here shouldn't block it.
 		logger::warn("NeuralNR: Target snippet nvngx_dlssnr.dll could not be loaded.");
-		return;
 	}
 
 	CSS::CallerSpoof::InstallUpscalerHooks();
