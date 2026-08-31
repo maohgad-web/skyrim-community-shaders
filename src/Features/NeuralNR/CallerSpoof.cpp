@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <thread>
 #include <vector>
+#include <atomic>
 #include <string>
 
 namespace CSS::CallerSpoof
@@ -67,6 +68,7 @@ namespace CSS::CallerSpoof
 		logger::info("NeuralNR [Diag]: Intercepted Streamline CreateFeature! Target FeatureID: {}", static_cast<uint32_t>(feat));
 
 		const bool isNR = (static_cast<int>(feat) == kFeatureDLSSNR);
+		const bool isSR = (feat == NVSDK_NGX_Feature_SuperSampling);
 
 		if (!s.streamlineContextCaptured && param && isNR)
 		{
@@ -77,6 +79,31 @@ namespace CSS::CallerSpoof
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
 				logger::warn("NeuralNR [Diag]: SEH caught access violation during CreateFeature parameter steal.");
+			}
+		}
+		// PATCH: wide-net fallback, tried alongside the confirmed-Feature-18
+		// path above rather than replacing it. Feature 18 has not been
+		// observed even once across every test this session — consistent
+		// with the guide's own Section 2 (dlss_nr_0 absent from Streamline's
+		// OTA manifest, plugin self-disables without the separate patch-
+		// and-inject step, which nothing here does). Rather than keep
+		// waiting on an event that may structurally never occur, this
+		// borrows SR's own live, already-validated block and lets our own
+		// directly-resolved CreateFeature attempt feature 18 against it —
+		// a genuinely different hypothesis (untested block completeness,
+		// per the guide's section 4 warning that a freshly allocated block
+		// "lacks the snippet and preset callbacks the feature expects").
+		// Logged distinctly so it's always clear which path actually
+		// supplied the block if this fires.
+		else if (!s.streamlineContextCaptured && param && isSR)
+		{
+			__try {
+				logger::info("NeuralNR [Diag]: Feature 18 not observed — borrowing live Feature 1 (SuperSampling) NGX_Parameter block as a wide-net fallback: {}", (void*)param);
+				s.nrParams = param;
+				s.streamlineContextCaptured = true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				logger::warn("NeuralNR [Diag]: SEH caught access violation during SuperSampling parameter borrow.");
 			}
 		}
 
@@ -332,14 +359,24 @@ namespace CSS::CallerSpoof
 		L"nvngx.dll",
 		L"_nvngx.dll"
 	};
-	static std::vector<bool> s_hookedStatus(std::size(s_targetModules), false);
+	// PATCH: std::vector<bool> is a well-known special case that bit-packs
+	// several booleans into shared storage words — writes to different
+	// indices from different threads can be a genuine data race if they
+	// land in the same word, unlike a normal vector<T>. With only 10
+	// entries here, several very plausibly share a word. This is touched
+	// from both the background polling thread (InstallUpscalerHooks) and
+	// the main render thread (InstallActiveInterceptors, every frame from
+	// OnPresent) — real atomics give each entry independent storage.
+	// Worth fixing on correctness grounds regardless of whether it's
+	// confirmed as the cause of any specific observed crash.
+	static std::atomic<bool> s_hookedStatus[std::size(s_targetModules)] = {};
 
 	bool InstallActiveInterceptors()
 	{
 		bool allHooked = true;
 		for (size_t i = 0; i < std::size(s_targetModules); ++i)
 		{
-			if (!s_hookedStatus[i])
+			if (!s_hookedStatus[i].load())
 			{
 				HMODULE hMod = GetModuleHandleW(s_targetModules[i]);
 				if (hMod)
@@ -365,7 +402,7 @@ namespace CSS::CallerSpoof
 					DumpModuleImports(hMod, logName);
 
 					logger::info("NeuralNR [Diag]: Successfully attached GetProcAddress + direct CreateFeature/EvaluateFeature/slOnPluginLoad hijack to {}.", logName);
-					s_hookedStatus[i] = true;
+					s_hookedStatus[i].store(true);
 				}
 				else
 				{

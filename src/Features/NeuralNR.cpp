@@ -37,6 +37,26 @@ namespace
 		}
 		return isHDR;
 	}
+
+	// PATCH: isolated into its own function with only POD/pointer parameters
+	// so __try/__except is unambiguously valid here — OnPresent itself
+	// constructs std::string temporaries (in SetSubrect), and mixing __try
+	// with C++ objects needing destructors in the same function is the same
+	// MSVC restriction already respected throughout CallerSpoof.cpp. Same
+	// rationale as CreateFeature's guard above: P may be a borrowed, foreign
+	// parameter block rather than one this code fully controls.
+	bool SafeEvaluateFeature(void* pfnEvaluateFeature, ID3D11DeviceContext* ctx, NVSDK_NGX_Handle* feature, NVSDK_NGX_Parameter* params, NVSDK_NGX_Result* outResult)
+	{
+		__try
+		{
+			*outResult = ((PFN_EvaluateFeature)pfnEvaluateFeature)(ctx, feature, params, nullptr);
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return false;
+		}
+	}
 }
 
 ID3D11Resource* NeuralNR::ResourceFromView(ID3D11View* view) const
@@ -86,10 +106,30 @@ bool NeuralNR::CreateFeature()
 	auto& s = GetState();
 	if (!s.pfnCreateFeature || !s.nrParams) return false;
 
+	// PATCH: SEH-guarded, matching the pattern already used throughout
+	// CallerSpoof.cpp for every other foreign/uncertain call. s.nrParams may
+	// now be a BORROWED block (Feature 1/SuperSampling's own live object,
+	// per the CallerSpoof wide-net fallback) rather than one this code
+	// allocated and fully controls — exactly the kind of call that pattern
+	// exists to protect against. Previously this call had no protection at
+	// all, unlike every equivalent call in CallerSpoof.cpp.
 	CSS::CallerSpoof::Install();
-	NVSDK_NGX_Result res = ((PFN_CreateFeature)s.pfnCreateFeature)(
-		globals::d3d::context, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), s.nrParams, &s.nrFeature);
+	NVSDK_NGX_Result res = static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
+	bool survived = true;
+	__try {
+		res = ((PFN_CreateFeature)s.pfnCreateFeature)(
+			globals::d3d::context, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), s.nrParams, &s.nrFeature);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		survived = false;
+	}
 	CSS::CallerSpoof::Uninstall();
+
+	if (!survived)
+	{
+		logger::error("NeuralNR: SEH caught access violation inside CreateFeature — likely incompatible with the borrowed parameter block.");
+		return false;
+	}
 
 	if (!NVSDK_NGX_SUCCEED(res) || !s.nrFeature)
 	{
@@ -233,9 +273,14 @@ void NeuralNR::OnPresent()
 	// 2. Await parameter capture from active DLSS execution (or after toggling DLSS in menu)
 	if (!s.streamlineContextCaptured || !s.nrParams || !s.pfnEvaluateFeature || !s.pfnCreateFeature) 
 	{
+		// PATCH: was a single generic "waiting" message — now shows exactly
+		// which of the four gate conditions is still unmet, readable
+		// directly from this log without cross-referencing CallerSpoof's
+		// separate log stream.
 		static uint32_t s_waitCounter = 0;
 		if (++s_waitCounter % 300 == 1)
-			logger::info("NeuralNR: Interceptors active. Waiting for DLSS execution/toggle to capture NGX parameters...");
+			logger::info("NeuralNR: Waiting — streamlineContextCaptured={}, nrParams={}, pfnEvaluateFeature={}, pfnCreateFeature={}",
+				s.streamlineContextCaptured, (void*)s.nrParams, s.pfnEvaluateFeature != nullptr, s.pfnCreateFeature != nullptr);
 		return; 
 	}
 
@@ -340,8 +385,11 @@ void NeuralNR::OnPresent()
 
 	// 5. Snippet Execution
 	CSS::CallerSpoof::Install();
-	NVSDK_NGX_Result evalRes = ((PFN_EvaluateFeature)s.pfnEvaluateFeature)(
-		ctx, s.nrFeature, P, nullptr);
+	NVSDK_NGX_Result evalRes = static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
+	if (!SafeEvaluateFeature(s.pfnEvaluateFeature, ctx, s.nrFeature, P, &evalRes))
+	{
+		logger::error("NeuralNR: SEH caught access violation calling EvaluateFeature — likely incompatible with the borrowed parameter block.");
+	}
 	CSS::CallerSpoof::Uninstall();
 
 	static bool s_loggedEval = false;
