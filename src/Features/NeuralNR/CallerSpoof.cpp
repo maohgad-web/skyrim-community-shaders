@@ -3,19 +3,63 @@
 #include "Utils/FileSystem.h"
 #include "Globals.h"
 #include <windows.h>
+#include <intrin.h>
 #include <thread>
 #include <vector>
 #include <atomic>
 #include <string>
 #include <detours/detours.h>
 
+#pragma intrinsic(_ReturnAddress)
+
 namespace CSS::CallerSpoof
 {
+	// PATCH: resolves a return address to the short filename of the module
+	// that owns it — the same technique the NGX snippet's own caller-
+	// identity check uses internally (per the guide's Section 2). Lets
+	// every hook below report WHICH module's code actually made the call,
+	// not just which modules we successfully patched. That's the direct
+	// answer to "does the data come from _nvngx.dll or sl.dlss.dll" --
+	// PatchModuleIATAny only tells us which modules import these names,
+	// this tells us which one's import slot actually got exercised.
+	static std::string GetCallingModuleShortName(void* returnAddress)
+	{
+		HMODULE hCallingModule = nullptr;
+		if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+				reinterpret_cast<LPCWSTR>(returnAddress), &hCallingModule) || !hCallingModule)
+			return "<unresolved>";
+
+		wchar_t path[MAX_PATH]{};
+		if (!GetModuleFileNameW(hCallingModule, path, MAX_PATH))
+			return "<unresolved>";
+
+		const wchar_t* lastBackslash = wcsrchr(path, L'\\');
+		const wchar_t* lastSlash = wcsrchr(path, L'/');
+		if (lastSlash && (!lastBackslash || lastSlash > lastBackslash)) lastBackslash = lastSlash;
+		const wchar_t* fileName = lastBackslash ? lastBackslash + 1 : path;
+
+		char narrow[MAX_PATH]{};
+		size_t converted = 0;
+		if (wcstombs_s(&converted, narrow, sizeof(narrow), fileName, _TRUNCATE) != 0)
+			return "<unresolved>";
+		return std::string(narrow);
+	}
+
 	using PFN_CreateFeature = NVSDK_NGX_Result (*)(ID3D11DeviceContext*, NVSDK_NGX_Feature, NVSDK_NGX_Parameter*, NVSDK_NGX_Handle**);
 	static PFN_CreateFeature s_orig_NGXCreate = nullptr;
 
 	using PFN_EvaluateFeature = NVSDK_NGX_Result (*)(ID3D11DeviceContext*, NVSDK_NGX_Handle*, NVSDK_NGX_Parameter*, void*);
 	static PFN_EvaluateFeature s_orig_NGXEvaluate = nullptr;
+
+	// PATCH: new candidate parameter source. The guide's Section 4
+	// describes the CORE's generic GetCapabilityParameters block as what
+	// CreateFeature actually expects -- distinct from a feature-specific
+	// block already captured inside another feature's own CreateFeature
+	// call (which is what the SuperSampling fallback borrows). Capturing
+	// this separately lets NeuralNR's own CreateFeature try both as
+	// independent candidates rather than assuming one is correct.
+	using PFN_GetCapabilityParameters = NVSDK_NGX_Result (*)(NVSDK_NGX_Parameter**);
+	static PFN_GetCapabilityParameters s_orig_NGXGetCapParams = nullptr;
 
 	// PATCH: slOnPluginLoad's real signature is unconfirmed here — the guide
 	// credits it to a third-party report on a different game under D3D12,
@@ -65,8 +109,9 @@ namespace CSS::CallerSpoof
 	static NVSDK_NGX_Result Hooked_NGXCreate(ID3D11DeviceContext* ctx, NVSDK_NGX_Feature feat, NVSDK_NGX_Parameter* param, NVSDK_NGX_Handle** handle)
 	{
 		auto& s = NeuralNR::GetState();
+		std::string callerModule = GetCallingModuleShortName(_ReturnAddress());
 
-		logger::info("NeuralNR [Diag]: Intercepted Streamline CreateFeature! Target FeatureID: {}", static_cast<uint32_t>(feat));
+		logger::info("NeuralNR [Diag]: Intercepted CreateFeature from {}! Target FeatureID: {}", callerModule, static_cast<uint32_t>(feat));
 
 		const bool isNR = (static_cast<int>(feat) == kFeatureDLSSNR);
 		const bool isSR = (feat == NVSDK_NGX_Feature_SuperSampling);
@@ -74,8 +119,9 @@ namespace CSS::CallerSpoof
 		if (!s.streamlineContextCaptured && param && isNR)
 		{
 			__try {
-				logger::info("NeuralNR [Diag]: Confirmed Feature 18 (Neural Rendering) — stealing NGX_Parameter block: {}", (void*)param);
+				logger::info("NeuralNR [Diag]: Confirmed Feature 18 (Neural Rendering) via {} — stealing NGX_Parameter block: {}", callerModule, (void*)param);
 				s.nrParams = param;
+				s.nrParamsCallerModule = callerModule;
 				s.streamlineContextCaptured = true;
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
@@ -99,8 +145,9 @@ namespace CSS::CallerSpoof
 		else if (!s.streamlineContextCaptured && param && isSR)
 		{
 			__try {
-				logger::info("NeuralNR [Diag]: Feature 18 not observed — borrowing live Feature 1 (SuperSampling) NGX_Parameter block as a wide-net fallback: {}", (void*)param);
+				logger::info("NeuralNR [Diag]: Feature 18 not observed — borrowing live Feature 1 (SuperSampling) NGX_Parameter block via {} as a wide-net fallback: {}", callerModule, (void*)param);
 				s.nrParams = param;
+				s.nrParamsCallerModule = callerModule;
 				s.streamlineContextCaptured = true;
 				// PATCH: marks this as the borrowed path so NeuralNR.cpp's own
 				// diagnostic logs can state which source supplied nrParams,
@@ -109,6 +156,25 @@ namespace CSS::CallerSpoof
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
 				logger::warn("NeuralNR [Diag]: SEH caught access violation during SuperSampling parameter borrow.");
+			}
+		}
+		// PATCH: second, independent candidate. If a primary block was
+		// already captured, but THIS call is for the same feature category
+		// (NR or SR) from a genuinely DIFFERENT module than the one that
+		// supplied the primary, capture it too -- directly tests "what if
+		// two modules both call this, and we locked onto the wrong one
+		// first" instead of only ever observing the second caller in the
+		// log without trying its data. Never overwrites nrParams; captured
+		// once, tried by CreateFeature only if the primary fails.
+		else if (s.streamlineContextCaptured && param && (isNR || isSR) && !s.nrParamsAlt && callerModule != s.nrParamsCallerModule)
+		{
+			__try {
+				logger::info("NeuralNR [Diag]: Second distinct caller observed ({}, feature {}) — capturing as an alternate candidate: {}", callerModule, static_cast<uint32_t>(feat), (void*)param);
+				s.nrParamsAlt = param;
+				s.nrParamsAltBorrowed = isSR;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				logger::warn("NeuralNR [Diag]: SEH caught access violation during alternate parameter capture.");
 			}
 		}
 
@@ -138,10 +204,11 @@ namespace CSS::CallerSpoof
 	static NVSDK_NGX_Result Hooked_NGXEvaluate(ID3D11DeviceContext* ctx, NVSDK_NGX_Handle* feat, NVSDK_NGX_Parameter* param, void* info)
 	{
 		auto& s = NeuralNR::GetState();
+		std::string callerModule = GetCallingModuleShortName(_ReturnAddress());
 
 		static uint32_t logCounter = 0;
 		if (logCounter++ % 300 == 0) {
-			logger::info("NeuralNR [Diag]: Streamline EvaluateFeature is running mid-game. Handle={}, ParamBlock={}", (void*)feat, (void*)param);
+			logger::info("NeuralNR [Diag]: EvaluateFeature running mid-game from {}. Handle={}, ParamBlock={}", callerModule, (void*)feat, (void*)param);
 		}
 
 		// PATCH: EvaluateFeature never receives a feature ID — only this
@@ -158,7 +225,7 @@ namespace CSS::CallerSpoof
 		if (!s.streamlineContextCaptured && param && (isConfirmedNR || noCreateSeenYet))
 		{
 			__try {
-				logger::info("NeuralNR [Diag]: Stealing NGX_Parameter block from EvaluateFeature (confirmed={}): {}", isConfirmedNR, (void*)param);
+				logger::info("NeuralNR [Diag]: Stealing NGX_Parameter block from EvaluateFeature via {} (confirmed={}): {}", callerModule, isConfirmedNR, (void*)param);
 				s.nrParams = param;
 				if (isConfirmedNR) s.nrFeature = feat;
 				s.streamlineContextCaptured = true;
@@ -179,11 +246,42 @@ namespace CSS::CallerSpoof
 		return static_cast<NVSDK_NGX_Result>(0xBAD00007);
 	}
 
+	static NVSDK_NGX_Result Hooked_NGXGetCapabilityParameters(NVSDK_NGX_Parameter** outParams)
+	{
+		std::string callerModule = GetCallingModuleShortName(_ReturnAddress());
+		NVSDK_NGX_Result res = static_cast<NVSDK_NGX_Result>(0xBAD00007);
+		if (s_orig_NGXGetCapParams) {
+			__try {
+				res = s_orig_NGXGetCapParams(outParams);
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				logger::warn("NeuralNR [Diag]: SEH caught crash inside original GetCapabilityParameters (caller={})!", callerModule);
+				return static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
+			}
+		}
+
+		auto& s = NeuralNR::GetState();
+		if (NVSDK_NGX_SUCCEED(res) && outParams && *outParams && !s.capabilityParamsCaptured)
+		{
+			__try {
+				logger::info("NeuralNR [Diag]: Captured core GetCapabilityParameters block via {}: {}", callerModule, (void*)*outParams);
+				s.capabilityParams = *outParams;
+				s.capabilityParamsCaptured = true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				logger::warn("NeuralNR [Diag]: SEH caught access violation during GetCapabilityParameters capture.");
+			}
+		}
+
+		return res;
+	}
+
 	static void* WINAPI Hooked_slOnPluginLoad(void* pluginContext)
 	{
-		// Log the call and the raw pointer first, before touching anything —
-		// confirms the hook fired at all regardless of what happens next.
-		logger::info("NeuralNR [Diag]: slOnPluginLoad intercepted! context={}", pluginContext);
+		// Log the call, the caller, and the raw pointer first, before
+		// touching anything -- confirms the hook fired at all regardless
+		// of what happens next.
+		std::string callerModule = GetCallingModuleShortName(_ReturnAddress());
+		logger::info("NeuralNR [Diag]: slOnPluginLoad intercepted from {}! context={}", callerModule, pluginContext);
 
 		if (s_orig_slOnPluginLoad) {
 			__try {
@@ -233,26 +331,40 @@ namespace CSS::CallerSpoof
 				if (!s_orig_slOnPluginLoad) s_orig_slOnPluginLoad = (PFN_slOnPluginLoad)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
 				return (FARPROC)Hooked_slOnPluginLoad;
 			}
+			if (_stricmp(lpProcName, "NVSDK_NGX_D3D11_GetCapabilityParameters") == 0)
+			{
+				if (!s_orig_NGXGetCapParams) s_orig_NGXGetCapParams = (PFN_GetCapabilityParameters)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
+				return (FARPROC)Hooked_NGXGetCapabilityParameters;
+			}
 		}
 		
 		if (s_origGetProcAddress) return s_origGetProcAddress(hModule, lpProcName);
 		return ::GetProcAddress(hModule, lpProcName);
 	}
 
-	static void PatchModuleIATAny(HMODULE hTargetModule, const char* targetFunction, void* hookFunc, void** origFunc)
+	// PATCH: now returns whether a matching import was actually found and
+	// patched, instead of silently returning nothing either way. Previously
+	// the "Successfully attached..." log fired unconditionally regardless
+	// of whether any of the four PatchModuleIATAny calls actually found
+	// anything -- meaning a module could report "success" while genuinely
+	// importing none of these names, which is exactly what made it
+	// impossible to tell which of _nvngx.dll / sl.dlss.dll / etc. actually
+	// carries these imports versus which ones we just happened to iterate.
+	static bool PatchModuleIATAny(HMODULE hTargetModule, const char* targetFunction, void* hookFunc, void** origFunc)
 	{
-		if (!hTargetModule) return;
+		if (!hTargetModule) return false;
 
 		PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)hTargetModule;
-		if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return;
+		if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return false;
 
 		PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((BYTE*)hTargetModule + dosHeader->e_lfanew);
-		if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return;
+		if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return false;
 
 		DWORD importDirRVA = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-		if (!importDirRVA) return;
+		if (!importDirRVA) return false;
 
 		PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)((BYTE*)hTargetModule + importDirRVA);
+		bool foundAny = false;
 
 		while (importDesc->Name)
 		{
@@ -272,6 +384,7 @@ namespace CSS::CallerSpoof
 							if (origFunc && !*origFunc) *origFunc = (void*)firstThunk->u1.Function;
 							firstThunk->u1.Function = (uintptr_t)hookFunc;
 							VirtualProtect(&firstThunk->u1.Function, sizeof(uintptr_t), oldProtect, &oldProtect);
+							foundAny = true;
 						}
 					}
 				}
@@ -280,6 +393,7 @@ namespace CSS::CallerSpoof
 			}
 			importDesc++;
 		}
+		return foundAny;
 	}
 
 	// PATCH: safe, READ-ONLY diagnostic — no patching, no calling, just
@@ -380,18 +494,25 @@ namespace CSS::CallerSpoof
 	// place, called from InstallActiveInterceptors below.
 	static void PatchTargetModuleAndMarkHooked(HMODULE hMod, size_t idx)
 	{
-		PatchModuleIATAny(hMod, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
-		PatchModuleIATAny(hMod, "NVSDK_NGX_D3D11_CreateFeature", (void*)Hooked_NGXCreate, (void**)&s_orig_NGXCreate);
-		PatchModuleIATAny(hMod, "NVSDK_NGX_D3D11_EvaluateFeature", (void*)Hooked_NGXEvaluate, (void**)&s_orig_NGXEvaluate);
-		PatchModuleIATAny(hMod, "slOnPluginLoad", (void*)Hooked_slOnPluginLoad, (void**)&s_orig_slOnPluginLoad);
-
 		char logName[64];
 		size_t converted = 0;
 		wcstombs_s(&converted, logName, sizeof(logName), s_targetModules[idx], _TRUNCATE);
 
+		// PATCH: each result captured and logged individually now that
+		// PatchModuleIATAny reports whether it actually found a match --
+		// this is what tells us which specific module (_nvngx.dll,
+		// sl.dlss.dll, etc.) genuinely imports each of these names, rather
+		// than a single blanket "success" line that fired regardless.
+		bool hasGetProcAddress = PatchModuleIATAny(hMod, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
+		bool hasCreateFeature  = PatchModuleIATAny(hMod, "NVSDK_NGX_D3D11_CreateFeature", (void*)Hooked_NGXCreate, (void**)&s_orig_NGXCreate);
+		bool hasEvaluateFeature = PatchModuleIATAny(hMod, "NVSDK_NGX_D3D11_EvaluateFeature", (void*)Hooked_NGXEvaluate, (void**)&s_orig_NGXEvaluate);
+		bool hasSlOnPluginLoad = PatchModuleIATAny(hMod, "slOnPluginLoad", (void*)Hooked_slOnPluginLoad, (void**)&s_orig_slOnPluginLoad);
+		bool hasGetCapParams   = PatchModuleIATAny(hMod, "NVSDK_NGX_D3D11_GetCapabilityParameters", (void*)Hooked_NGXGetCapabilityParameters, (void**)&s_orig_NGXGetCapParams);
+
 		DumpModuleImports(hMod, logName);
 
-		logger::info("NeuralNR [Diag]: Successfully attached GetProcAddress + direct CreateFeature/EvaluateFeature/slOnPluginLoad hijack to {}.", logName);
+		logger::info("NeuralNR [Diag]: Scanned {} -- GetProcAddress={}, CreateFeature={}, EvaluateFeature={}, GetCapabilityParameters={}, slOnPluginLoad={} (true = import found and patched).",
+			logName, hasGetProcAddress, hasCreateFeature, hasEvaluateFeature, hasGetCapParams, hasSlOnPluginLoad);
 		s_hookedStatus[idx].store(true);
 	}
 

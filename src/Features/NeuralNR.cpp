@@ -99,6 +99,21 @@ namespace
 			return false;
 		}
 	}
+
+	// PATCH: isolated so __try/__except is valid here, shared by both
+	// candidate parameter sources CreateFeature now tries in sequence.
+	bool SafeCreateFeatureCall(void* pfnCreateFeature, ID3D11DeviceContext* ctx, NVSDK_NGX_Parameter* params, NVSDK_NGX_Handle** outHandle, NVSDK_NGX_Result* outResult)
+	{
+		__try
+		{
+			*outResult = ((PFN_CreateFeature)pfnCreateFeature)(ctx, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), params, outHandle);
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return false;
+		}
+	}
 }
 
 ID3D11Resource* NeuralNR::ResourceFromView(ID3D11View* view) const
@@ -162,41 +177,54 @@ bool NeuralNR::CompileShaders()
 bool NeuralNR::CreateFeature()
 {
 	auto& s = GetState();
-	if (!s.pfnCreateFeature || !s.nrParams) return false;
+	if (!s.pfnCreateFeature) return false;
 
-	// PATCH: SEH-guarded, matching the pattern already used throughout
-	// CallerSpoof.cpp for every other foreign/uncertain call. s.nrParams may
-	// now be a BORROWED block (Feature 1/SuperSampling's own live object,
-	// per the CallerSpoof wide-net fallback) rather than one this code
-	// allocated and fully controls — exactly the kind of call that pattern
-	// exists to protect against. Previously this call had no protection at
-	// all, unlike every equivalent call in CallerSpoof.cpp.
-	CSS::CallerSpoof::Install();
-	NVSDK_NGX_Result res = static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
-	bool survived = true;
-	__try {
-		res = ((PFN_CreateFeature)s.pfnCreateFeature)(
-			globals::d3d::context, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), s.nrParams, &s.nrFeature);
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER) {
-		survived = false;
-	}
-	CSS::CallerSpoof::Uninstall();
+	// PATCH: wide-net cascade across two independent candidate sources,
+	// rather than assuming one is correct. s.nrParams (confirmed Feature
+	// 18, or the SuperSampling wide-net fallback) may be a block already
+	// specialized for a DIFFERENT feature by the time we borrow it -- the
+	// guide's own Section 4 describes CreateFeature expecting the core's
+	// generic GetCapabilityParameters block instead, which is now captured
+	// separately as s.capabilityParams and tried second. Worth remembering
+	// this project is D3D11 with a Streamline-hook architecture that
+	// matches neither the guide's own Vulkan verification nor the
+	// D3D12/Streamline third-party report it credits -- "success" here may
+	// look different from either, so testing both sources on their own
+	// terms is deliberate, not a placeholder until we pick the "right" one.
+	auto attempt = [&](NVSDK_NGX_Parameter* params, const char* label) -> bool {
+		if (!params) return false;
 
-	if (!survived)
-	{
-		logger::error("NeuralNR: SEH caught access violation inside CreateFeature — likely incompatible with the borrowed parameter block.");
-		return false;
-	}
+		CSS::CallerSpoof::Install();
+		NVSDK_NGX_Result res = static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
+		bool survived = SafeCreateFeatureCall(s.pfnCreateFeature, globals::d3d::context, params, &s.nrFeature, &res);
+		CSS::CallerSpoof::Uninstall();
 
-	if (!NVSDK_NGX_SUCCEED(res) || !s.nrFeature)
-	{
-		logger::error("NeuralNR: Snippet CreateFeature failed, res=0x{:X} (paramsAreBorrowed={})", static_cast<uint32_t>(res), s.paramsAreBorrowed);
-		return false;
-	}
+		if (!survived)
+		{
+			logger::error("NeuralNR: SEH caught access violation inside CreateFeature (source={}).", label);
+			return false;
+		}
+		if (!NVSDK_NGX_SUCCEED(res) || !s.nrFeature)
+		{
+			logger::error("NeuralNR: Snippet CreateFeature failed, res=0x{:X} (source={})", static_cast<uint32_t>(res), label);
+			return false;
+		}
+		logger::info("NeuralNR: Snippet CreateFeature Success. Tensor context established. (source={})", label);
+		return true;
+	};
 
-	logger::info("NeuralNR: Snippet CreateFeature Success. Tensor context established. (paramsAreBorrowed={})", s.paramsAreBorrowed);
-	return true;
+	if (attempt(s.nrParams, s.paramsAreBorrowed ? "SR-borrowed" : "confirmed-Feature18"))
+		return true;
+
+	// PATCH: third candidate -- a second, distinct-caller block, captured
+	// only if a genuinely different module than the one behind s.nrParams
+	// also called CreateFeature for NR or SR (see Hooked_NGXCreate). Tests
+	// "what if two modules both called, and we locked onto the wrong one
+	// first" directly, rather than only observing it in the log.
+	if (attempt(s.nrParamsAlt, s.nrParamsAltBorrowed ? "alt-caller-SR-borrowed" : "alt-caller-confirmed-Feature18"))
+		return true;
+
+	return attempt(s.capabilityParams, "core-GetCapabilityParameters");
 }
 
 void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
@@ -348,6 +376,25 @@ void NeuralNR::OnPresent()
 			logger::info("NeuralNR: Waiting — streamlineContextCaptured={}, nrParams={}, pfnEvaluateFeature={}, pfnCreateFeature={}, paramsAreBorrowed={}",
 				s.streamlineContextCaptured, (void*)s.nrParams, s.pfnEvaluateFeature != nullptr, s.pfnCreateFeature != nullptr, s.paramsAreBorrowed);
 		return; 
+	}
+
+	// PATCH: fires once, the moment we have SOMETHING to work with,
+	// regardless of whether CreateFeature ever succeeds afterward -- this
+	// was previously placed after a successful EvaluateFeature call, which
+	// meant it never fired at all given CreateFeature has never once
+	// succeeded. Confirms whether our own directly-loaded snippet DLL
+	// instance matches Streamline's own loaded copy: if they match, a
+	// handle Streamline created against its copy is safe to hand to our
+	// resolved function pointers (same module, same internal state either
+	// way); if they differ, that's a real, separate problem worth knowing
+	// about independent of which parameter source ends up working.
+	static bool s_loggedInstanceCheck = false;
+	if (!s_loggedInstanceCheck)
+	{
+		HMODULE hStreamlineCopy = GetModuleHandleW(L"nvngx_dlssnr.dll");
+		logger::info("NeuralNR: Instance check — ours={}, Streamline's={}, match={}",
+			(void*)s.hSnippetDLL, (void*)hStreamlineCopy, (hStreamlineCopy == s.hSnippetDLL));
+		s_loggedInstanceCheck = true;
 	}
 
 	auto ctx = globals::d3d::context;
