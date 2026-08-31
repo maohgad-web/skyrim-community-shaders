@@ -17,6 +17,9 @@ namespace CSS::CallerSpoof
 	using PFN_EvaluateFeature = NVSDK_NGX_Result (*)(ID3D11DeviceContext*, NVSDK_NGX_Handle*, NVSDK_NGX_Parameter*, void*);
 	static PFN_EvaluateFeature s_orig_NGXEvaluate = nullptr;
 
+	using PFN_slOnPluginLoad = void* (*)(void*);
+	static PFN_slOnPluginLoad s_orig_slOnPluginLoad = nullptr;
+
 	using GetProcAddress_t = FARPROC(WINAPI*)(HMODULE, LPCSTR);
 	static GetProcAddress_t s_origGetProcAddress = nullptr;
 
@@ -370,7 +373,8 @@ namespace CSS::CallerSpoof
 			size_t idx = 0;
 			if (hLoaded && FindTargetModuleIndex(fileName, &idx) && !s_hookedStatus[idx].load())
 			{
-				logger::info("NeuralNR [Diag]: Instant-hook caught a target module load: {}", fileName);
+				// FIXED: Removed fileName parameter to prevent fmt from rejecting wide-string pointer formatting
+				logger::info("NeuralNR [Diag]: Instant-hook caught a target module load via LoadLibrary.");
 				PatchTargetModuleAndMarkHooked(hLoaded, idx);
 
 				// Hybrid Detours Strategy for Streamline
