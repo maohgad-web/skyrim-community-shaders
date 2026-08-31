@@ -7,6 +7,7 @@
 #include <vector>
 #include <atomic>
 #include <string>
+#include <detours.h>
 
 namespace CSS::CallerSpoof
 {
@@ -371,6 +372,27 @@ namespace CSS::CallerSpoof
 	// confirmed as the cause of any specific observed crash.
 	static std::atomic<bool> s_hookedStatus[std::size(s_targetModules)] = {};
 
+	// PATCH: extracted so both the poll-based path below AND the new
+	// instant-hook path (Hooked_LoadLibraryW etc., further down) can apply
+	// the exact same patching logic to a module the moment either mechanism
+	// discovers it — no duplicated logic between the two.
+	static void PatchTargetModuleAndMarkHooked(HMODULE hMod, size_t idx)
+	{
+		PatchModuleIATAny(hMod, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
+		PatchModuleIATAny(hMod, "NVSDK_NGX_D3D11_CreateFeature", (void*)Hooked_NGXCreate, (void**)&s_orig_NGXCreate);
+		PatchModuleIATAny(hMod, "NVSDK_NGX_D3D11_EvaluateFeature", (void*)Hooked_NGXEvaluate, (void**)&s_orig_NGXEvaluate);
+		PatchModuleIATAny(hMod, "slOnPluginLoad", (void*)Hooked_slOnPluginLoad, (void**)&s_orig_slOnPluginLoad);
+
+		char logName[64];
+		size_t converted = 0;
+		wcstombs_s(&converted, logName, sizeof(logName), s_targetModules[idx], _TRUNCATE);
+
+		DumpModuleImports(hMod, logName);
+
+		logger::info("NeuralNR [Diag]: Successfully attached GetProcAddress + direct CreateFeature/EvaluateFeature/slOnPluginLoad hijack to {}.", logName);
+		s_hookedStatus[idx].store(true);
+	}
+
 	bool InstallActiveInterceptors()
 	{
 		bool allHooked = true;
@@ -381,28 +403,7 @@ namespace CSS::CallerSpoof
 				HMODULE hMod = GetModuleHandleW(s_targetModules[i]);
 				if (hMod)
 				{
-	PatchModuleIATAny(hMod, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
-
-					// Direct by-name IAT patches (bypasses the "was it
-					// resolved before our hook attached / via a static
-					// import" gap entirely — works on whatever's already in
-					// the IAT regardless of how it got there).
-					PatchModuleIATAny(hMod, "NVSDK_NGX_D3D11_CreateFeature", (void*)Hooked_NGXCreate, (void**)&s_orig_NGXCreate);
-					PatchModuleIATAny(hMod, "NVSDK_NGX_D3D11_EvaluateFeature", (void*)Hooked_NGXEvaluate, (void**)&s_orig_NGXEvaluate);
-					PatchModuleIATAny(hMod, "slOnPluginLoad", (void*)Hooked_slOnPluginLoad, (void**)&s_orig_slOnPluginLoad);
-
-					char logName[64];
-					size_t converted = 0;
-					wcstombs_s(&converted, logName, sizeof(logName), s_targetModules[i], _TRUNCATE);
-
-					// PATCH: safe, read-only dump of every import this module
-					// actually has — settles the ordinal question and shows
-					// real D3D11-environment lifecycle names instead of
-					// continuing to guess from a Vulkan/D3D12 report.
-					DumpModuleImports(hMod, logName);
-
-					logger::info("NeuralNR [Diag]: Successfully attached GetProcAddress + direct CreateFeature/EvaluateFeature/slOnPluginLoad hijack to {}.", logName);
-					s_hookedStatus[i].store(true);
+					PatchTargetModuleAndMarkHooked(hMod, i);
 				}
 				else
 				{
@@ -413,8 +414,156 @@ namespace CSS::CallerSpoof
 		return allHooked;
 	}
 
+	static bool FindTargetModuleIndex(const wchar_t* moduleFileName, size_t* outIndex)
+	{
+		for (size_t i = 0; i < std::size(s_targetModules); ++i)
+		{
+			if (_wcsicmp(moduleFileName, s_targetModules[i]) == 0)
+			{
+				if (outIndex) *outIndex = i;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	static const wchar_t* StripToFileNameW(const wchar_t* path)
+	{
+		const wchar_t* lastBackslash = wcsrchr(path, L'\\');
+		const wchar_t* lastSlash = wcsrchr(path, L'/');
+		if (lastSlash && (!lastBackslash || lastSlash > lastBackslash)) lastBackslash = lastSlash;
+		return lastBackslash ? lastBackslash + 1 : path;
+	}
+
+	// --- Instant-hook on module load, via Detours, as a lower-latency
+	// alternative to polling. Detours is already a project dependency (used
+	// elsewhere in Community Shaders), so no new build-system work is needed.
+	// Deliberately scoped to LoadLibrary* only — NOT GetProcAddress, which is
+	// a much hotter, much more heavily-targeted function in a crowded
+	// modding ecosystem (SKSE plugins, ENB, ReShade, possibly other Community
+	// Shaders features) where a second, unrelated inline hook on the same
+	// function's prologue bytes is a real collision risk. LoadLibrary* is
+	// called far less often, making that collision risk much smaller, and
+	// directly closes the actual gap observed in testing: modules load, then
+	// sit undetected until the next 200ms poll tick — sometimes several
+	// seconds late. This patches a matching module the instant it loads
+	// instead. InstallActiveInterceptors() keeps running in parallel
+	// regardless, as the deliberate fallback: if this hook fails to install,
+	// or a target module was already loaded before this installed at all,
+	// the poll still eventually catches it.
+	using PFN_LoadLibraryW   = HMODULE(WINAPI*)(LPCWSTR);
+	using PFN_LoadLibraryA   = HMODULE(WINAPI*)(LPCSTR);
+	using PFN_LoadLibraryExW = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
+	using PFN_LoadLibraryExA = HMODULE(WINAPI*)(LPCSTR, HANDLE, DWORD);
+
+	static PFN_LoadLibraryW   s_origLoadLibraryW   = LoadLibraryW;
+	static PFN_LoadLibraryA   s_origLoadLibraryA   = LoadLibraryA;
+	static PFN_LoadLibraryExW s_origLoadLibraryExW = LoadLibraryExW;
+	static PFN_LoadLibraryExA s_origLoadLibraryExA = LoadLibraryExA;
+
+	static void TryInstantPatch(HMODULE hLoaded, const wchar_t* fileName)
+	{
+		// SEH-guarded: runs inside a hooked WinAPI entry point, on whatever
+		// thread happened to call LoadLibrary — same uncertain-context
+		// caution as every other hook in this file.
+		__try
+		{
+			size_t idx = 0;
+			if (hLoaded && FindTargetModuleIndex(fileName, &idx) && !s_hookedStatus[idx].load())
+			{
+				logger::info("NeuralNR [Diag]: Instant-hook caught a target module load via LoadLibrary — patching immediately instead of waiting for the next poll.");
+				PatchTargetModuleAndMarkHooked(hLoaded, idx);
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			logger::warn("NeuralNR [Diag]: SEH caught access violation in the LoadLibrary instant-patch path.");
+		}
+	}
+
+	static HMODULE WINAPI Hooked_LoadLibraryW(LPCWSTR lpLibFileName)
+	{
+		HMODULE result = nullptr;
+		__try { result = s_origLoadLibraryW(lpLibFileName); }
+		__except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+		if (result && lpLibFileName) TryInstantPatch(result, StripToFileNameW(lpLibFileName));
+		return result;
+	}
+
+	static HMODULE WINAPI Hooked_LoadLibraryA(LPCSTR lpLibFileName)
+	{
+		HMODULE result = nullptr;
+		__try { result = s_origLoadLibraryA(lpLibFileName); }
+		__except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+		if (result && lpLibFileName)
+		{
+			wchar_t wide[MAX_PATH]{};
+			size_t converted = 0;
+			if (mbstowcs_s(&converted, wide, MAX_PATH, lpLibFileName, _TRUNCATE) == 0)
+				TryInstantPatch(result, StripToFileNameW(wide));
+		}
+		return result;
+	}
+
+	static HMODULE WINAPI Hooked_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags)
+	{
+		HMODULE result = nullptr;
+		__try { result = s_origLoadLibraryExW(lpLibFileName, hFile, dwFlags); }
+		__except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+		if (result && lpLibFileName) TryInstantPatch(result, StripToFileNameW(lpLibFileName));
+		return result;
+	}
+
+	static HMODULE WINAPI Hooked_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DWORD dwFlags)
+	{
+		HMODULE result = nullptr;
+		__try { result = s_origLoadLibraryExA(lpLibFileName, hFile, dwFlags); }
+		__except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+		if (result && lpLibFileName)
+		{
+			wchar_t wide[MAX_PATH]{};
+			size_t converted = 0;
+			if (mbstowcs_s(&converted, wide, MAX_PATH, lpLibFileName, _TRUNCATE) == 0)
+				TryInstantPatch(result, StripToFileNameW(wide));
+		}
+		return result;
+	}
+
+	static bool s_loadLibraryHooksInstalled = false;
+
+	static void InstallLoadLibraryInstantHook()
+	{
+		if (s_loadLibraryHooksInstalled) return;
+
+		DetourTransactionBegin();
+		DetourUpdateThread(GetCurrentThread());
+		DetourAttach(&(PVOID&)s_origLoadLibraryW, Hooked_LoadLibraryW);
+		DetourAttach(&(PVOID&)s_origLoadLibraryA, Hooked_LoadLibraryA);
+		DetourAttach(&(PVOID&)s_origLoadLibraryExW, Hooked_LoadLibraryExW);
+		DetourAttach(&(PVOID&)s_origLoadLibraryExA, Hooked_LoadLibraryExA);
+		LONG err = DetourTransactionCommit();
+
+		if (err == NO_ERROR)
+		{
+			s_loadLibraryHooksInstalled = true;
+			logger::info("NeuralNR [Diag]: LoadLibrary instant-hook installed successfully — modules will be patched the moment they load instead of on the next poll tick.");
+		}
+		else
+		{
+			logger::warn("NeuralNR [Diag]: LoadLibrary instant-hook failed to install (err={}) — falling back to poll-only detection via InstallActiveInterceptors.", err);
+		}
+	}
+
 	void InstallUpscalerHooks()
 	{
+		// Install the low-latency instant-hook first (synchronous, cheap).
+		// The poll-based background thread still starts regardless right
+		// after — deliberate belt-and-suspenders: whichever mechanism catches
+		// a given module first wins, and if the Detours hook fails to
+		// install for any reason, the poll thread alone still eventually gets
+		// there, exactly as it did before this change.
+		InstallLoadLibraryInstantHook();
+
 		std::thread([]() {
 			while (!InstallActiveInterceptors())
 				Sleep(200);
