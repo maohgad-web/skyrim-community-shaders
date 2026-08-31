@@ -22,16 +22,29 @@ namespace CSS::CallerSpoof
 	// answer to "does the data come from _nvngx.dll or sl.dlss.dll" --
 	// PatchModuleIATAny only tells us which modules import these names,
 	// this tells us which one's import slot actually got exercised.
-	static std::string GetCallingModuleShortName(void* returnAddress)
+	// PATCH: writes into a caller-provided fixed buffer instead of
+	// returning std::string by value. Every caller of this function is
+	// itself a __try/__except-guarded hook, and MSVC's C2712 ("cannot use
+	// __try in functions that require object unwinding") forbids mixing
+	// __try with ANY local object needing destruction in the same
+	// function -- including one implicitly created to hold a by-value
+	// std::string return. A fixed-size char buffer is a POD with no
+	// destructor, so it's safe to hold directly in a __try-containing
+	// function. This is exactly the same discipline already applied to
+	// every Safe* helper elsewhere in this file -- missed here because
+	// the diagnostic was added after those were already established.
+	static void GetCallingModuleShortName(void* returnAddress, char* outBuffer, size_t outBufferSize)
 	{
+		strncpy_s(outBuffer, outBufferSize, "<unresolved>", _TRUNCATE);
+
 		HMODULE hCallingModule = nullptr;
 		if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
 				reinterpret_cast<LPCWSTR>(returnAddress), &hCallingModule) || !hCallingModule)
-			return "<unresolved>";
+			return;
 
 		wchar_t path[MAX_PATH]{};
 		if (!GetModuleFileNameW(hCallingModule, path, MAX_PATH))
-			return "<unresolved>";
+			return;
 
 		const wchar_t* lastBackslash = wcsrchr(path, L'\\');
 		const wchar_t* lastSlash = wcsrchr(path, L'/');
@@ -40,9 +53,8 @@ namespace CSS::CallerSpoof
 
 		char narrow[MAX_PATH]{};
 		size_t converted = 0;
-		if (wcstombs_s(&converted, narrow, sizeof(narrow), fileName, _TRUNCATE) != 0)
-			return "<unresolved>";
-		return std::string(narrow);
+		if (wcstombs_s(&converted, narrow, sizeof(narrow), fileName, _TRUNCATE) == 0)
+			strncpy_s(outBuffer, outBufferSize, narrow, _TRUNCATE);
 	}
 
 	using PFN_CreateFeature = NVSDK_NGX_Result (*)(ID3D11DeviceContext*, NVSDK_NGX_Feature, NVSDK_NGX_Parameter*, NVSDK_NGX_Handle**);
@@ -109,7 +121,8 @@ namespace CSS::CallerSpoof
 	static NVSDK_NGX_Result Hooked_NGXCreate(ID3D11DeviceContext* ctx, NVSDK_NGX_Feature feat, NVSDK_NGX_Parameter* param, NVSDK_NGX_Handle** handle)
 	{
 		auto& s = NeuralNR::GetState();
-		std::string callerModule = GetCallingModuleShortName(_ReturnAddress());
+		char callerModule[64];
+		GetCallingModuleShortName(_ReturnAddress(), callerModule, sizeof(callerModule));
 
 		logger::info("NeuralNR [Diag]: Intercepted CreateFeature from {}! Target FeatureID: {}", callerModule, static_cast<uint32_t>(feat));
 
@@ -204,7 +217,8 @@ namespace CSS::CallerSpoof
 	static NVSDK_NGX_Result Hooked_NGXEvaluate(ID3D11DeviceContext* ctx, NVSDK_NGX_Handle* feat, NVSDK_NGX_Parameter* param, void* info)
 	{
 		auto& s = NeuralNR::GetState();
-		std::string callerModule = GetCallingModuleShortName(_ReturnAddress());
+		char callerModule[64];
+		GetCallingModuleShortName(_ReturnAddress(), callerModule, sizeof(callerModule));
 
 		static uint32_t logCounter = 0;
 		if (logCounter++ % 300 == 0) {
@@ -248,7 +262,8 @@ namespace CSS::CallerSpoof
 
 	static NVSDK_NGX_Result Hooked_NGXGetCapabilityParameters(NVSDK_NGX_Parameter** outParams)
 	{
-		std::string callerModule = GetCallingModuleShortName(_ReturnAddress());
+		char callerModule[64];
+		GetCallingModuleShortName(_ReturnAddress(), callerModule, sizeof(callerModule));
 		NVSDK_NGX_Result res = static_cast<NVSDK_NGX_Result>(0xBAD00007);
 		if (s_orig_NGXGetCapParams) {
 			__try {
@@ -280,7 +295,8 @@ namespace CSS::CallerSpoof
 		// Log the call, the caller, and the raw pointer first, before
 		// touching anything -- confirms the hook fired at all regardless
 		// of what happens next.
-		std::string callerModule = GetCallingModuleShortName(_ReturnAddress());
+		char callerModule[64];
+		GetCallingModuleShortName(_ReturnAddress(), callerModule, sizeof(callerModule));
 		logger::info("NeuralNR [Diag]: slOnPluginLoad intercepted from {}! context={}", callerModule, pluginContext);
 
 		if (s_orig_slOnPluginLoad) {
