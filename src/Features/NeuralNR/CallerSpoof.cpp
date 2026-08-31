@@ -145,17 +145,19 @@ namespace CSS::CallerSpoof
 
 	enum slFeature : uint32_t { kFeatureDLSS_NR = 1004 }; 
 	
+	// FIXED: Correctly aligned layout matching the official Streamline 2.x SDK
 	struct slPreferences {
-		bool showConsole;
-		int logLevel;
-		void* pathsToPlugins;
+		void* allocateCallback;
+		void* freeCallback;
+		void* logMessageCallback;
+		uint32_t logLevel;
+		const wchar_t** pathsToPlugins; // Now correctly placed at +32 bytes (after 4b padding)
 		uint32_t numPathsToPlugins;
-		const slFeature* featuresToLoad;
+		const slFeature* featuresToLoad; // Now correctly placed at +48 bytes
 		uint32_t numFeaturesToLoad;
-		uint32_t renderAPI;
 	};
 
-	using slInit_t = int (*)(const slPreferences*, void*, void*);
+	using slInit_t = int (*)(const void*, void*, void*);
 	using slIsFeatureSupported_t = int (*)(slFeature, const void*);
 	using slGetPluginFunction_t = void* (*)(const char*);
 	using slOnPluginLoad_t = bool (*)(sl::param::IParameters*);
@@ -166,9 +168,14 @@ namespace CSS::CallerSpoof
 	static slOnPluginLoad_t s_orig_slOnPluginLoad_nr = nullptr;
 	static std::vector<slFeature> s_modifiedFeatures;
 
-	static int Hooked_slInit(const slPreferences* pref, void* app, void* device)
+	static int Hooked_slInit(const void* pref_opaque, void* app, void* device)
 	{
-		slPreferences modPref = *pref;
+		if (!pref_opaque) {
+			return s_orig_slInit(pref_opaque, app, device);
+		}
+
+		// Modify safely in place instead of copying the struct to prevent truncation
+		slPreferences* pref = (slPreferences*)const_cast<void*>(pref_opaque);
 		s_modifiedFeatures.clear();
 		
 		bool nrFound = false;
@@ -179,14 +186,25 @@ namespace CSS::CallerSpoof
 			}
 		}
 		
+		const slFeature* origFeatures = pref->featuresToLoad;
+		uint32_t origNum = pref->numFeaturesToLoad;
+
 		if (!nrFound) {
 			s_modifiedFeatures.push_back(kFeatureDLSS_NR);
-			modPref.featuresToLoad = s_modifiedFeatures.data();
-			modPref.numFeaturesToLoad = static_cast<uint32_t>(s_modifiedFeatures.size());
+			pref->featuresToLoad = s_modifiedFeatures.data();
+			pref->numFeaturesToLoad = static_cast<uint32_t>(s_modifiedFeatures.size());
 			logger::info("NeuralNR [Streamline]: Injected Feature 1004 (DLSS-NR) into slPreferences.");
 		}
 		
-		return s_orig_slInit(&modPref, app, device);
+		int result = s_orig_slInit(pref_opaque, app, device);
+
+		// Restore original pointers after execution
+		if (!nrFound) {
+			pref->featuresToLoad = origFeatures;
+			pref->numFeaturesToLoad = origNum;
+		}
+		
+		return result;
 	}
 
 	static int Hooked_slIsFeatureSupported(slFeature feature, const void* pArch)
