@@ -3,86 +3,19 @@
 #include "Utils/FileSystem.h"
 #include "Globals.h"
 #include <windows.h>
-#include <intrin.h>
 #include <thread>
 #include <vector>
 #include <atomic>
 #include <string>
 #include <detours/detours.h>
 
-#pragma intrinsic(_ReturnAddress)
-
 namespace CSS::CallerSpoof
 {
-	// PATCH: resolves a return address to the short filename of the module
-	// that owns it — the same technique the NGX snippet's own caller-
-	// identity check uses internally (per the guide's Section 2). Lets
-	// every hook below report WHICH module's code actually made the call,
-	// not just which modules we successfully patched. That's the direct
-	// answer to "does the data come from _nvngx.dll or sl.dlss.dll" --
-	// PatchModuleIATAny only tells us which modules import these names,
-	// this tells us which one's import slot actually got exercised.
-	// PATCH: writes into a caller-provided fixed buffer instead of
-	// returning std::string by value. Every caller of this function is
-	// itself a __try/__except-guarded hook, and MSVC's C2712 ("cannot use
-	// __try in functions that require object unwinding") forbids mixing
-	// __try with ANY local object needing destruction in the same
-	// function -- including one implicitly created to hold a by-value
-	// std::string return. A fixed-size char buffer is a POD with no
-	// destructor, so it's safe to hold directly in a __try-containing
-	// function. This is exactly the same discipline already applied to
-	// every Safe* helper elsewhere in this file -- missed here because
-	// the diagnostic was added after those were already established.
-	static void GetCallingModuleShortName(void* returnAddress, char* outBuffer, size_t outBufferSize)
-	{
-		strncpy_s(outBuffer, outBufferSize, "<unresolved>", _TRUNCATE);
-
-		HMODULE hCallingModule = nullptr;
-		if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-				reinterpret_cast<LPCWSTR>(returnAddress), &hCallingModule) || !hCallingModule)
-			return;
-
-		wchar_t path[MAX_PATH]{};
-		if (!GetModuleFileNameW(hCallingModule, path, MAX_PATH))
-			return;
-
-		const wchar_t* lastBackslash = wcsrchr(path, L'\\');
-		const wchar_t* lastSlash = wcsrchr(path, L'/');
-		if (lastSlash && (!lastBackslash || lastSlash > lastBackslash)) lastBackslash = lastSlash;
-		const wchar_t* fileName = lastBackslash ? lastBackslash + 1 : path;
-
-		char narrow[MAX_PATH]{};
-		size_t converted = 0;
-		if (wcstombs_s(&converted, narrow, sizeof(narrow), fileName, _TRUNCATE) == 0)
-			strncpy_s(outBuffer, outBufferSize, narrow, _TRUNCATE);
-	}
-
 	using PFN_CreateFeature = NVSDK_NGX_Result (*)(ID3D11DeviceContext*, NVSDK_NGX_Feature, NVSDK_NGX_Parameter*, NVSDK_NGX_Handle**);
 	static PFN_CreateFeature s_orig_NGXCreate = nullptr;
 
 	using PFN_EvaluateFeature = NVSDK_NGX_Result (*)(ID3D11DeviceContext*, NVSDK_NGX_Handle*, NVSDK_NGX_Parameter*, void*);
 	static PFN_EvaluateFeature s_orig_NGXEvaluate = nullptr;
-
-	// PATCH: new candidate parameter source. The guide's Section 4
-	// describes the CORE's generic GetCapabilityParameters block as what
-	// CreateFeature actually expects -- distinct from a feature-specific
-	// block already captured inside another feature's own CreateFeature
-	// call (which is what the SuperSampling fallback borrows). Capturing
-	// this separately lets NeuralNR's own CreateFeature try both as
-	// independent candidates rather than assuming one is correct.
-	using PFN_GetCapabilityParameters = NVSDK_NGX_Result (*)(NVSDK_NGX_Parameter**);
-	static PFN_GetCapabilityParameters s_orig_NGXGetCapParams = nullptr;
-
-	// PATCH: slOnPluginLoad's real signature is unconfirmed here — the guide
-	// credits it to a third-party report on a different game under D3D12,
-	// not this D3D11 environment. Treated as generically/safely as possible:
-	// a single opaque context pointer, matching the guide's own description
-	// ("captures that object"). Deliberately NOT dereferencing its contents
-	// yet — only logging the raw pointer value — until DumpModuleImports
-	// confirms this name (or something like it) actually exists here, and
-	// ideally until its real layout is confirmed rather than guessed.
-	using PFN_slOnPluginLoad = void* (*)(void*);
-	static PFN_slOnPluginLoad s_orig_slOnPluginLoad = nullptr;
 
 	using GetProcAddress_t = FARPROC(WINAPI*)(HMODULE, LPCSTR);
 	static GetProcAddress_t s_origGetProcAddress = nullptr;
@@ -112,83 +45,24 @@ namespace CSS::CallerSpoof
 		return 0;
 	}
 
-	// --- SEH-Guarded Diagnostic Interceptors ---
-	// PATCH: feature ID confirmed via kFeatureDLSSNR (18) rather than assumed
-	// from timing alone — the ID is already present in this call's own
-	// signature (feat), just previously unused for the steal decision.
 	constexpr int kFeatureDLSSNR = 18;
 
 	static NVSDK_NGX_Result Hooked_NGXCreate(ID3D11DeviceContext* ctx, NVSDK_NGX_Feature feat, NVSDK_NGX_Parameter* param, NVSDK_NGX_Handle** handle)
 	{
 		auto& s = NeuralNR::GetState();
-		char callerModule[64];
-		GetCallingModuleShortName(_ReturnAddress(), callerModule, sizeof(callerModule));
-
-		logger::info("NeuralNR [Diag]: Intercepted CreateFeature from {}! Target FeatureID: {}", callerModule, static_cast<uint32_t>(feat));
+		logger::info("NeuralNR [Diag]: Intercepted Streamline CreateFeature! Target FeatureID: {}", static_cast<uint32_t>(feat));
 
 		const bool isNR = (static_cast<int>(feat) == kFeatureDLSSNR);
-		const bool isSR = (feat == NVSDK_NGX_Feature_SuperSampling);
 
 		if (!s.streamlineContextCaptured && param && isNR)
 		{
 			__try {
-				logger::info("NeuralNR [Diag]: Confirmed Feature 18 (Neural Rendering) via {} — stealing NGX_Parameter block: {}", callerModule, (void*)param);
+				logger::info("NeuralNR [Streamline]: Confirmed Feature 18 (Neural Rendering) — stealing NGX_Parameter block: {}", (void*)param);
 				s.nrParams = param;
-				s.nrParamsCallerModule = callerModule;
 				s.streamlineContextCaptured = true;
+                s.paramsAreBorrowed = false;
 			}
-			__except (EXCEPTION_EXECUTE_HANDLER) {
-				logger::warn("NeuralNR [Diag]: SEH caught access violation during CreateFeature parameter steal.");
-			}
-		}
-		// PATCH: wide-net fallback, tried alongside the confirmed-Feature-18
-		// path above rather than replacing it. Feature 18 has not been
-		// observed even once across every test this session — consistent
-		// with the guide's own Section 2 (dlss_nr_0 absent from Streamline's
-		// OTA manifest, plugin self-disables without the separate patch-
-		// and-inject step, which nothing here does). Rather than keep
-		// waiting on an event that may structurally never occur, this
-		// borrows SR's own live, already-validated block and lets our own
-		// directly-resolved CreateFeature attempt feature 18 against it —
-		// a genuinely different hypothesis (untested block completeness,
-		// per the guide's section 4 warning that a freshly allocated block
-		// "lacks the snippet and preset callbacks the feature expects").
-		// Logged distinctly so it's always clear which path actually
-		// supplied the block if this fires.
-		else if (!s.streamlineContextCaptured && param && isSR)
-		{
-			__try {
-				logger::info("NeuralNR [Diag]: Feature 18 not observed — borrowing live Feature 1 (SuperSampling) NGX_Parameter block via {} as a wide-net fallback: {}", callerModule, (void*)param);
-				s.nrParams = param;
-				s.nrParamsCallerModule = callerModule;
-				s.streamlineContextCaptured = true;
-				// PATCH: marks this as the borrowed path so NeuralNR.cpp's own
-				// diagnostic logs can state which source supplied nrParams,
-				// without needing to cross-reference this separate log stream.
-				s.paramsAreBorrowed = true;
-			}
-			__except (EXCEPTION_EXECUTE_HANDLER) {
-				logger::warn("NeuralNR [Diag]: SEH caught access violation during SuperSampling parameter borrow.");
-			}
-		}
-		// PATCH: second, independent candidate. If a primary block was
-		// already captured, but THIS call is for the same feature category
-		// (NR or SR) from a genuinely DIFFERENT module than the one that
-		// supplied the primary, capture it too -- directly tests "what if
-		// two modules both call this, and we locked onto the wrong one
-		// first" instead of only ever observing the second caller in the
-		// log without trying its data. Never overwrites nrParams; captured
-		// once, tried by CreateFeature only if the primary fails.
-		else if (s.streamlineContextCaptured && param && (isNR || isSR) && !s.nrParamsAlt && callerModule != s.nrParamsCallerModule)
-		{
-			__try {
-				logger::info("NeuralNR [Diag]: Second distinct caller observed ({}, feature {}) — capturing as an alternate candidate: {}", callerModule, static_cast<uint32_t>(feat), (void*)param);
-				s.nrParamsAlt = param;
-				s.nrParamsAltBorrowed = isSR;
-			}
-			__except (EXCEPTION_EXECUTE_HANDLER) {
-				logger::warn("NeuralNR [Diag]: SEH caught access violation during alternate parameter capture.");
-			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
 		}
 
 		NVSDK_NGX_Result createRes = static_cast<NVSDK_NGX_Result>(0xBAD00007);
@@ -196,15 +70,10 @@ namespace CSS::CallerSpoof
 			__try {
 				createRes = s_orig_NGXCreate(ctx, feat, param, handle);
 			} __except (EXCEPTION_EXECUTE_HANDLER) {
-				logger::warn("NeuralNR [Diag]: SEH caught crash inside original Streamline CreateFeature!");
 				return static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
 			}
 		}
 
-		// PATCH: record the real handle NGX returned specifically for feature
-		// 18, so Hooked_NGXEvaluate — which never receives a feature ID, only
-		// an opaque handle — can confirm by exact pointer match instead of
-		// guessing which evaluate call belongs to NR.
 		if (isNR && handle && *handle)
 		{
 			s.nrFeature = *handle;
@@ -217,121 +86,161 @@ namespace CSS::CallerSpoof
 	static NVSDK_NGX_Result Hooked_NGXEvaluate(ID3D11DeviceContext* ctx, NVSDK_NGX_Handle* feat, NVSDK_NGX_Parameter* param, void* info)
 	{
 		auto& s = NeuralNR::GetState();
-		char callerModule[64];
-		GetCallingModuleShortName(_ReturnAddress(), callerModule, sizeof(callerModule));
-
-		static uint32_t logCounter = 0;
-		if (logCounter++ % 300 == 0) {
-			logger::info("NeuralNR [Diag]: EvaluateFeature running mid-game from {}. Handle={}, ParamBlock={}", callerModule, (void*)feat, (void*)param);
-		}
-
-		// PATCH: EvaluateFeature never receives a feature ID — only this
-		// opaque handle. The only way to know it's genuinely NR is to check
-		// it against the handle Hooked_NGXCreate already confirmed was
-		// returned for feature 18. Without s.nrFeature set yet, there's
-		// nothing trustworthy to steal here — it could be SR's or FG's
-		// handle just as easily. Falls back to the old first-caller-wins
-		// behavior only if Create was never seen at all (e.g. NR's feature
-		// was already created before these hooks installed).
 		const bool isConfirmedNR = s.nrFeature && (feat == s.nrFeature);
 		const bool noCreateSeenYet = !s.nrFeature;
 
 		if (!s.streamlineContextCaptured && param && (isConfirmedNR || noCreateSeenYet))
 		{
 			__try {
-				logger::info("NeuralNR [Diag]: Stealing NGX_Parameter block from EvaluateFeature via {} (confirmed={}): {}", callerModule, isConfirmedNR, (void*)param);
+				logger::info("NeuralNR [Streamline]: Stealing NGX_Parameter block from EvaluateFeature (confirmed={}): {}", isConfirmedNR, (void*)param);
 				s.nrParams = param;
 				if (isConfirmedNR) s.nrFeature = feat;
 				s.streamlineContextCaptured = true;
 			}
-			__except (EXCEPTION_EXECUTE_HANDLER) {
-				logger::warn("NeuralNR [Diag]: SEH caught access violation during EvaluateFeature parameter steal.");
-			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
 		}
 
 		if (s_orig_NGXEvaluate) {
 			__try {
 				return s_orig_NGXEvaluate(ctx, feat, param, info);
 			} __except (EXCEPTION_EXECUTE_HANDLER) {
-				logger::warn("NeuralNR [Diag]: SEH caught crash inside original Streamline EvaluateFeature!");
 				return static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
 			}
 		}
 		return static_cast<NVSDK_NGX_Result>(0xBAD00007);
 	}
 
-	static NVSDK_NGX_Result Hooked_NGXGetCapabilityParameters(NVSDK_NGX_Parameter** outParams)
-	{
-		char callerModule[64];
-		GetCallingModuleShortName(_ReturnAddress(), callerModule, sizeof(callerModule));
-		NVSDK_NGX_Result res = static_cast<NVSDK_NGX_Result>(0xBAD00007);
-		if (s_orig_NGXGetCapParams) {
-			__try {
-				res = s_orig_NGXGetCapParams(outParams);
-			} __except (EXCEPTION_EXECUTE_HANDLER) {
-				logger::warn("NeuralNR [Diag]: SEH caught crash inside original GetCapabilityParameters (caller={})!", callerModule);
-				return static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
-			}
-		}
+	// --- Hybrid Streamline Interceptors ---
+	namespace sl::param {
+		struct IParameters {
+			virtual int set_bool(const char* key, bool value) = 0;
+			virtual int set_ull(const char* key, unsigned long long value) = 0;
+			virtual int set_flt(const char* key, float value) = 0;
+			virtual int set_dbl(const char* key, double value) = 0;
+			virtual int set_u32(const char* key, uint32_t value) = 0;
+			virtual int set_i32(const char* key, int32_t value) = 0;
+			virtual int set_ptr(const char* key, void* value) = 0;
+			virtual int set_str(const char* key, const char* value) = 0;
 
-		auto& s = NeuralNR::GetState();
-		if (NVSDK_NGX_SUCCEED(res) && outParams && *outParams && !s.capabilityParamsCaptured)
-		{
-			__try {
-				logger::info("NeuralNR [Diag]: Captured core GetCapabilityParameters block via {}: {}", callerModule, (void*)*outParams);
-				s.capabilityParams = *outParams;
-				s.capabilityParamsCaptured = true;
-			}
-			__except (EXCEPTION_EXECUTE_HANDLER) {
-				logger::warn("NeuralNR [Diag]: SEH caught access violation during GetCapabilityParameters capture.");
-			}
-		}
-
-		return res;
+			virtual int get_bool(const char* key, bool* value) const = 0;
+			virtual int get_ull(const char* key, unsigned long long* value) const = 0;
+			virtual int get_flt(const char* key, float* value) const = 0;
+			virtual int get_dbl(const char* key, double* value) const = 0;
+			virtual int get_u32(const char* key, uint32_t* value) const = 0;
+			virtual int get_i32(const char* key, int32_t* value) const = 0;
+			virtual int get_ptr(const char* key, void** value) const = 0;
+			virtual int get_str(const char* key, const char** value) const = 0;
+		};
 	}
 
-	static void* WINAPI Hooked_slOnPluginLoad(void* pluginContext)
-	{
-		// Log the call, the caller, and the raw pointer first, before
-		// touching anything -- confirms the hook fired at all regardless
-		// of what happens next.
-		char callerModule[64];
-		GetCallingModuleShortName(_ReturnAddress(), callerModule, sizeof(callerModule));
-		logger::info("NeuralNR [Diag]: slOnPluginLoad intercepted from {}! context={}", callerModule, pluginContext);
+	enum slFeature : uint32_t { kFeatureDLSS_NR = 1004 }; 
+	
+	struct slPreferences {
+		bool showConsole;
+		int logLevel;
+		void* pathsToPlugins;
+		uint32_t numPathsToPlugins;
+		const slFeature* featuresToLoad;
+		uint32_t numFeaturesToLoad;
+		uint32_t renderAPI;
+	};
 
-		if (s_orig_slOnPluginLoad) {
-			__try {
-				return s_orig_slOnPluginLoad(pluginContext);
-			} __except (EXCEPTION_EXECUTE_HANDLER) {
-				logger::warn("NeuralNR [Diag]: SEH caught crash forwarding to original slOnPluginLoad — signature guess was likely wrong.");
-				return pluginContext; // best-effort passthrough rather than losing the value entirely
+	using slInit_t = int (*)(const slPreferences*, void*, void*);
+	using slIsFeatureSupported_t = int (*)(slFeature, const void*);
+	using slGetPluginFunction_t = void* (*)(const char*);
+	using slOnPluginLoad_t = bool (*)(sl::param::IParameters*);
+
+	static slInit_t s_orig_slInit = nullptr;
+	static slIsFeatureSupported_t s_orig_slIsFeatureSupported = nullptr;
+	static slGetPluginFunction_t s_orig_slGetPluginFunction_nr = nullptr;
+	static slOnPluginLoad_t s_orig_slOnPluginLoad_nr = nullptr;
+	static std::vector<slFeature> s_modifiedFeatures;
+
+	static int Hooked_slInit(const slPreferences* pref, void* app, void* device)
+	{
+		slPreferences modPref = *pref;
+		s_modifiedFeatures.clear();
+		
+		bool nrFound = false;
+		if (pref->featuresToLoad && pref->numFeaturesToLoad > 0) {
+			for (uint32_t i = 0; i < pref->numFeaturesToLoad; ++i) {
+				s_modifiedFeatures.push_back(pref->featuresToLoad[i]);
+				if (pref->featuresToLoad[i] == kFeatureDLSS_NR) nrFound = true;
 			}
 		}
-		return pluginContext;
+		
+		if (!nrFound) {
+			s_modifiedFeatures.push_back(kFeatureDLSS_NR);
+			modPref.featuresToLoad = s_modifiedFeatures.data();
+			modPref.numFeaturesToLoad = static_cast<uint32_t>(s_modifiedFeatures.size());
+			logger::info("NeuralNR [Streamline]: Injected Feature 1004 (DLSS-NR) into slPreferences.");
+		}
+		
+		return s_orig_slInit(&modPref, app, device);
+	}
+
+	static int Hooked_slIsFeatureSupported(slFeature feature, const void* pArch)
+	{
+		if (feature == kFeatureDLSS_NR) {
+			logger::info("NeuralNR [Streamline]: Spoofing slIsFeatureSupported for 1004 -> eOk");
+			return 0; 
+		}
+		return s_orig_slIsFeatureSupported(feature, pArch);
+	}
+
+	static bool Hooked_slOnPluginLoad_NR(sl::param::IParameters* params)
+	{
+		logger::info("NeuralNR [Streamline]: slOnPluginLoad executing for sl.dlss_nr.dll! Params: {}", (void*)params);
+		auto& s = NeuralNR::GetState();
+
+		if (params) {
+			void* pContext = nullptr;
+			if (params->get_ptr("sl.param.global.ngxContext", &pContext) == 0 && pContext) {
+				logger::info("NeuralNR [Streamline]: Probed global NGX Context: {}", pContext);
+			}
+			
+			void* pBlock = nullptr;
+			if (params->get_ptr("sl.param.dlss_nr.ngxParameters", &pBlock) == 0 && pBlock) {
+				logger::info("NeuralNR [Streamline]: Extracted native NR NGX Parameter block: {}", pBlock);
+				s.nrParams = static_cast<NVSDK_NGX_Parameter*>(pBlock);
+				s.streamlineContextCaptured = true;
+				s.paramsAreBorrowed = false;
+			} else if (params->get_ptr("sl.param.global.ngxParameters", &pBlock) == 0 && pBlock) {
+				logger::info("NeuralNR [Streamline]: Extracted global NGX Parameter block: {}", pBlock);
+				if (!s.nrParams) {
+					s.nrParams = static_cast<NVSDK_NGX_Parameter*>(pBlock);
+					s.streamlineContextCaptured = true;
+					s.paramsAreBorrowed = false;
+				}
+			}
+		}
+
+		bool result = false;
+		if (s_orig_slOnPluginLoad_nr) {
+			__try {
+				result = s_orig_slOnPluginLoad_nr(params);
+			} __except (EXCEPTION_EXECUTE_HANDLER) {}
+		}
+		
+		logger::info("NeuralNR [Streamline]: Original sl.dlss_nr.dll slOnPluginLoad returned {}. Forcing TRUE to bypass manifest gate.", result);
+		return true; 
+	}
+
+	static void* Hooked_slGetPluginFunction_NR(const char* functionName)
+	{
+		void* func = s_orig_slGetPluginFunction_nr(functionName);
+		if (functionName && _stricmp(functionName, "slOnPluginLoad") == 0) {
+			logger::info("NeuralNR [Streamline]: Intercepted slGetPluginFunction request for slOnPluginLoad.");
+			s_orig_slOnPluginLoad_nr = (slOnPluginLoad_t)func;
+			return (void*)Hooked_slOnPluginLoad_NR;
+		}
+		return func;
 	}
 
 	static FARPROC WINAPI Hooked_GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
 	{
 		if (lpProcName && ((ULONG_PTR)lpProcName > 0xFFFF))
 		{
-			// PATCH: log EVERY distinct symbol name looked up on our hooked
-			// modules, not just the ones we react to. This is the actual
-			// "stop guessing" step — rather than trying one name at a time
-			// across separate builds, this dumps every real dynamic lookup
-			// Streamline's D3D11 plugins make in a single test run. Dedup'd
-			// by name so a hot lookup path doesn't flood the log.
-			{
-				static std::vector<std::string> s_loggedNames;
-				bool alreadyLogged = false;
-				for (const auto& n : s_loggedNames) {
-					if (_stricmp(n.c_str(), lpProcName) == 0) { alreadyLogged = true; break; }
-				}
-				if (!alreadyLogged) {
-					s_loggedNames.emplace_back(lpProcName);
-					logger::info("NeuralNR [Dump]: GetProcAddress lookup for: {}", lpProcName);
-				}
-			}
-
 			if (_stricmp(lpProcName, "NVSDK_NGX_D3D11_CreateFeature") == 0)
 			{
 				if (!s_orig_NGXCreate) s_orig_NGXCreate = (PFN_CreateFeature)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
@@ -342,51 +251,27 @@ namespace CSS::CallerSpoof
 				if (!s_orig_NGXEvaluate) s_orig_NGXEvaluate = (PFN_EvaluateFeature)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
 				return (FARPROC)Hooked_NGXEvaluate;
 			}
-			if (_stricmp(lpProcName, "slOnPluginLoad") == 0)
-			{
-				if (!s_orig_slOnPluginLoad) s_orig_slOnPluginLoad = (PFN_slOnPluginLoad)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
-				return (FARPROC)Hooked_slOnPluginLoad;
-			}
-			if (_stricmp(lpProcName, "NVSDK_NGX_D3D11_GetCapabilityParameters") == 0)
-			{
-				if (!s_orig_NGXGetCapParams) s_orig_NGXGetCapParams = (PFN_GetCapabilityParameters)(s_origGetProcAddress ? s_origGetProcAddress(hModule, lpProcName) : ::GetProcAddress(hModule, lpProcName));
-				return (FARPROC)Hooked_NGXGetCapabilityParameters;
-			}
 		}
 		
 		if (s_origGetProcAddress) return s_origGetProcAddress(hModule, lpProcName);
 		return ::GetProcAddress(hModule, lpProcName);
 	}
 
-	// PATCH: now returns whether a matching import was actually found and
-	// patched, instead of silently returning nothing either way. Previously
-	// the "Successfully attached..." log fired unconditionally regardless
-	// of whether any of the four PatchModuleIATAny calls actually found
-	// anything -- meaning a module could report "success" while genuinely
-	// importing none of these names, which is exactly what made it
-	// impossible to tell which of _nvngx.dll / sl.dlss.dll / etc. actually
-	// carries these imports versus which ones we just happened to iterate.
-	static bool PatchModuleIATAny(HMODULE hTargetModule, const char* targetFunction, void* hookFunc, void** origFunc)
+	static void PatchModuleIATAny(HMODULE hTargetModule, const char* targetFunction, void* hookFunc, void** origFunc)
 	{
-		if (!hTargetModule) return false;
-
+		if (!hTargetModule) return;
 		PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)hTargetModule;
-		if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return false;
-
+		if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return;
 		PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((BYTE*)hTargetModule + dosHeader->e_lfanew);
-		if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return false;
-
+		if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return;
 		DWORD importDirRVA = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-		if (!importDirRVA) return false;
+		if (!importDirRVA) return;
 
 		PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)((BYTE*)hTargetModule + importDirRVA);
-		bool foundAny = false;
-
 		while (importDesc->Name)
 		{
 			PIMAGE_THUNK_DATA originalFirstThunk = (PIMAGE_THUNK_DATA)((BYTE*)hTargetModule + importDesc->OriginalFirstThunk);
 			PIMAGE_THUNK_DATA firstThunk = (PIMAGE_THUNK_DATA)((BYTE*)hTargetModule + importDesc->FirstThunk);
-
 			while (originalFirstThunk->u1.AddressOfData)
 			{
 				if (!(originalFirstThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG))
@@ -400,7 +285,6 @@ namespace CSS::CallerSpoof
 							if (origFunc && !*origFunc) *origFunc = (void*)firstThunk->u1.Function;
 							firstThunk->u1.Function = (uintptr_t)hookFunc;
 							VirtualProtect(&firstThunk->u1.Function, sizeof(uintptr_t), oldProtect, &oldProtect);
-							foundAny = true;
 						}
 					}
 				}
@@ -409,79 +293,8 @@ namespace CSS::CallerSpoof
 			}
 			importDesc++;
 		}
-		return foundAny;
 	}
 
-	// PATCH: safe, READ-ONLY diagnostic — no patching, no calling, just
-	// walking and logging every import table entry a module actually has.
-	// This directly answers the ordinal question from last message (are
-	// NVSDK_NGX_D3D11_CreateFeature/EvaluateFeature genuinely absent by
-	// name, or ordinal-only?) and gives full visibility into what THIS
-	// specific D3D11 build's Streamline plugins actually call, instead of
-	// continuing to guess names one at a time from a Vulkan/D3D12 report.
-	// Ordinal-only entries are logged as "ordinal N" since there's no name
-	// to print, but they ARE logged (PatchModuleIATAny above still skips
-	// them for patching purposes — this is purely informational).
-	static void DumpModuleImports(HMODULE hTargetModule, const char* moduleNameForLog)
-	{
-		if (!hTargetModule) return;
-
-		PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)hTargetModule;
-		if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return;
-
-		PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((BYTE*)hTargetModule + dosHeader->e_lfanew);
-		if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return;
-
-		DWORD importDirRVA = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-		if (!importDirRVA)
-		{
-			logger::info("NeuralNR [Dump]: {} has no import table.", moduleNameForLog);
-			return;
-		}
-
-		PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)((BYTE*)hTargetModule + importDirRVA);
-
-		while (importDesc->Name)
-		{
-			const char* dllName = (const char*)((BYTE*)hTargetModule + importDesc->Name);
-			PIMAGE_THUNK_DATA originalFirstThunk = (PIMAGE_THUNK_DATA)((BYTE*)hTargetModule + importDesc->OriginalFirstThunk);
-
-			while (originalFirstThunk->u1.AddressOfData)
-			{
-				if (originalFirstThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG)
-				{
-					logger::info("NeuralNR [Dump]: {} imports from {}: ordinal {}",
-						moduleNameForLog, dllName, static_cast<uint32_t>(IMAGE_ORDINAL(originalFirstThunk->u1.Ordinal)));
-				}
-				else
-				{
-					PIMAGE_IMPORT_BY_NAME importByName = (PIMAGE_IMPORT_BY_NAME)((BYTE*)hTargetModule + originalFirstThunk->u1.AddressOfData);
-					logger::info("NeuralNR [Dump]: {} imports from {}: {}",
-						moduleNameForLog, dllName, (const char*)importByName->Name);
-				}
-				originalFirstThunk++;
-			}
-			importDesc++;
-		}
-	}
-
-	// PATCH: the header (CallerSpoof.h) declares InstallUpscalerHooks() and
-	// InstallActiveInterceptors() — this file previously defined neither,
-	// only a differently-named InstallStreamlineHooks(), which meant both
-	// declared functions were unresolved-external at link time (NeuralNR.cpp
-	// calls both). Restructured so both real names exist, sharing one
-	// idempotent core so calling it repeatedly (every frame, from OnPresent)
-	// is cheap once everything's already hooked.
-	//
-	// NOTE — thread-safety worth knowing about: this shared state
-	// (s_hookedStatus / s_origGetProcAddress) is now touched both from the
-	// background polling thread (InstallUpscalerHooks) and from the main
-	// render thread (InstallActiveInterceptors, called every frame from
-	// OnPresent) with no locking between them. In practice the window is
-	// narrow — each entry only transitions its status once — but it's a
-	// genuine, unaddressed data race, not just a style nitpick. Flagging it
-	// rather than silently leaving it, since it's outside what was asked
-	// (compile errors) but directly relevant to this exact restructure.
 	static const wchar_t* s_targetModules[] = {
 		L"sl.interposer.dll",
 		L"sl.common.dll",
@@ -494,41 +307,13 @@ namespace CSS::CallerSpoof
 		L"nvngx.dll",
 		L"_nvngx.dll"
 	};
-	// PATCH: std::vector<bool> is a well-known special case that bit-packs
-	// several booleans into shared storage words — writes to different
-	// indices from different threads can be a genuine data race if they
-	// land in the same word, unlike a normal vector<T>. With only 10
-	// entries here, several very plausibly share a word. This is touched
-	// from both the background polling thread (InstallUpscalerHooks) and
-	// the main render thread (InstallActiveInterceptors, every frame from
-	// OnPresent) — real atomics give each entry independent storage.
-	// Worth fixing on correctness grounds regardless of whether it's
-	// confirmed as the cause of any specific observed crash.
 	static std::atomic<bool> s_hookedStatus[std::size(s_targetModules)] = {};
 
-	// Extracted into its own function so the patching logic lives in one
-	// place, called from InstallActiveInterceptors below.
 	static void PatchTargetModuleAndMarkHooked(HMODULE hMod, size_t idx)
 	{
-		char logName[64];
-		size_t converted = 0;
-		wcstombs_s(&converted, logName, sizeof(logName), s_targetModules[idx], _TRUNCATE);
-
-		// PATCH: each result captured and logged individually now that
-		// PatchModuleIATAny reports whether it actually found a match --
-		// this is what tells us which specific module (_nvngx.dll,
-		// sl.dlss.dll, etc.) genuinely imports each of these names, rather
-		// than a single blanket "success" line that fired regardless.
-		bool hasGetProcAddress = PatchModuleIATAny(hMod, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
-		bool hasCreateFeature  = PatchModuleIATAny(hMod, "NVSDK_NGX_D3D11_CreateFeature", (void*)Hooked_NGXCreate, (void**)&s_orig_NGXCreate);
-		bool hasEvaluateFeature = PatchModuleIATAny(hMod, "NVSDK_NGX_D3D11_EvaluateFeature", (void*)Hooked_NGXEvaluate, (void**)&s_orig_NGXEvaluate);
-		bool hasSlOnPluginLoad = PatchModuleIATAny(hMod, "slOnPluginLoad", (void*)Hooked_slOnPluginLoad, (void**)&s_orig_slOnPluginLoad);
-		bool hasGetCapParams   = PatchModuleIATAny(hMod, "NVSDK_NGX_D3D11_GetCapabilityParameters", (void*)Hooked_NGXGetCapabilityParameters, (void**)&s_orig_NGXGetCapParams);
-
-		DumpModuleImports(hMod, logName);
-
-		logger::info("NeuralNR [Diag]: Scanned {} -- GetProcAddress={}, CreateFeature={}, EvaluateFeature={}, GetCapabilityParameters={}, slOnPluginLoad={} (true = import found and patched).",
-			logName, hasGetProcAddress, hasCreateFeature, hasEvaluateFeature, hasGetCapParams, hasSlOnPluginLoad);
+		PatchModuleIATAny(hMod, "GetProcAddress", (void*)Hooked_GetProcAddress, (void**)&s_origGetProcAddress);
+		PatchModuleIATAny(hMod, "NVSDK_NGX_D3D11_CreateFeature", (void*)Hooked_NGXCreate, (void**)&s_orig_NGXCreate);
+		PatchModuleIATAny(hMod, "NVSDK_NGX_D3D11_EvaluateFeature", (void*)Hooked_NGXEvaluate, (void**)&s_orig_NGXEvaluate);
 		s_hookedStatus[idx].store(true);
 	}
 
@@ -540,14 +325,8 @@ namespace CSS::CallerSpoof
 			if (!s_hookedStatus[i].load())
 			{
 				HMODULE hMod = GetModuleHandleW(s_targetModules[i]);
-				if (hMod)
-				{
-					PatchTargetModuleAndMarkHooked(hMod, i);
-				}
-				else
-				{
-					allHooked = false;
-				}
+				if (hMod) { PatchTargetModuleAndMarkHooked(hMod, i); }
+				else { allHooked = false; }
 			}
 		}
 		return allHooked;
@@ -574,25 +353,6 @@ namespace CSS::CallerSpoof
 		return lastBackslash ? lastBackslash + 1 : path;
 	}
 
-	// --- Instant-hook on module load, via Detours, as a lower-latency
-	// alternative to polling. Confirmed available and correctly wired for
-	// this exact target via CMakeLists.txt's find_path(DETOURS_INCLUDE_DIRS
-	// "detours/detours.h") + target_include_directories/target_link_libraries
-	// on ${PROJECT_NAME} — the earlier compile failure was solely the wrong
-	// include path (detours.h instead of detours/detours.h), not a missing
-	// or unwired dependency. Deliberately scoped to LoadLibrary* only — NOT
-	// GetProcAddress, which is a much hotter, much more heavily-targeted
-	// function in a crowded modding ecosystem (SKSE plugins, ENB, ReShade,
-	// possibly other Community Shaders features) where a second, unrelated
-	// inline hook on the same function's prologue bytes is a real collision
-	// risk. LoadLibrary* is called far less often, making that collision
-	// risk much smaller, and directly closes the actual gap observed in
-	// testing: modules load, then sit undetected until the next 200ms poll
-	// tick — sometimes several seconds late. This patches a matching module
-	// the instant it loads instead. InstallActiveInterceptors() keeps
-	// running in parallel regardless, as the deliberate fallback: if this
-	// hook fails to install, or a target module was already loaded before
-	// this installed at all, the poll still eventually catches it.
 	using PFN_LoadLibraryW   = HMODULE(WINAPI*)(LPCWSTR);
 	using PFN_LoadLibraryA   = HMODULE(WINAPI*)(LPCSTR);
 	using PFN_LoadLibraryExW = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
@@ -605,22 +365,43 @@ namespace CSS::CallerSpoof
 
 	static void TryInstantPatch(HMODULE hLoaded, const wchar_t* fileName)
 	{
-		// SEH-guarded: runs inside a hooked WinAPI entry point, on whatever
-		// thread happened to call LoadLibrary — same uncertain-context
-		// caution as every other hook in this file.
 		__try
 		{
 			size_t idx = 0;
 			if (hLoaded && FindTargetModuleIndex(fileName, &idx) && !s_hookedStatus[idx].load())
 			{
-				logger::info("NeuralNR [Diag]: Instant-hook caught a target module load via LoadLibrary — patching immediately instead of waiting for the next poll.");
+				logger::info("NeuralNR [Diag]: Instant-hook caught a target module load: {}", fileName);
 				PatchTargetModuleAndMarkHooked(hLoaded, idx);
+
+				// Hybrid Detours Strategy for Streamline
+				if (_wcsicmp(fileName, L"sl.interposer.dll") == 0) {
+					void* pSlInit = (void*)GetProcAddress(hLoaded, "slInit");
+					void* pSlIsFeatureSupported = (void*)GetProcAddress(hLoaded, "slIsFeatureSupported");
+					if (pSlInit && pSlIsFeatureSupported) {
+						DetourTransactionBegin();
+						DetourUpdateThread(GetCurrentThread());
+						s_orig_slInit = (slInit_t)pSlInit;
+						s_orig_slIsFeatureSupported = (slIsFeatureSupported_t)pSlIsFeatureSupported;
+						DetourAttach(&(PVOID&)s_orig_slInit, (PVOID)Hooked_slInit);
+						DetourAttach(&(PVOID&)s_orig_slIsFeatureSupported, (PVOID)Hooked_slIsFeatureSupported);
+						DetourTransactionCommit();
+						logger::info("NeuralNR [Streamline]: Detoured slInit & slIsFeatureSupported on sl.interposer.dll");
+					}
+				}
+				else if (_wcsicmp(fileName, L"sl.dlss_nr.dll") == 0) {
+					void* pGetPlugin = (void*)GetProcAddress(hLoaded, "slGetPluginFunction");
+					if (pGetPlugin) {
+						DetourTransactionBegin();
+						DetourUpdateThread(GetCurrentThread());
+						s_orig_slGetPluginFunction_nr = (slGetPluginFunction_t)pGetPlugin;
+						DetourAttach(&(PVOID&)s_orig_slGetPluginFunction_nr, (PVOID)Hooked_slGetPluginFunction_NR);
+						DetourTransactionCommit();
+						logger::info("NeuralNR [Streamline]: Detoured slGetPluginFunction on sl.dlss_nr.dll");
+					}
+				}
 			}
 		}
-		__except (EXCEPTION_EXECUTE_HANDLER)
-		{
-			logger::warn("NeuralNR [Diag]: SEH caught access violation in the LoadLibrary instant-patch path.");
-		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {}
 	}
 
 	static HMODULE WINAPI Hooked_LoadLibraryW(LPCWSTR lpLibFileName)
@@ -688,22 +469,12 @@ namespace CSS::CallerSpoof
 		if (err == NO_ERROR)
 		{
 			s_loadLibraryHooksInstalled = true;
-			logger::info("NeuralNR [Diag]: LoadLibrary instant-hook installed successfully — modules will be patched the moment they load instead of on the next poll tick.");
-		}
-		else
-		{
-			logger::warn("NeuralNR [Diag]: LoadLibrary instant-hook failed to install (err={}) — falling back to poll-only detection via InstallActiveInterceptors.", err);
+			logger::info("NeuralNR [Diag]: LoadLibrary instant-hook installed successfully.");
 		}
 	}
 
 	void InstallUpscalerHooks()
 	{
-		// Install the low-latency instant-hook first (synchronous, cheap).
-		// The poll-based background thread still starts regardless right
-		// after — deliberate belt-and-suspenders: whichever mechanism catches
-		// a given module first wins, and if the Detours hook fails to
-		// install for any reason, the poll thread alone still eventually gets
-		// there, exactly as it did before this change.
 		InstallLoadLibraryInstantHook();
 
 		std::thread([]() {

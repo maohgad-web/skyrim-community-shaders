@@ -8,4 +8,3 @@ namespace CSS::CallerSpoof
 	void InstallUpscalerHooks();
 	bool InstallActiveInterceptors();
 }
-

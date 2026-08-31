@@ -38,13 +38,6 @@ namespace
 		return isHDR;
 	}
 
-	// PATCH: isolated into its own function with only POD/pointer parameters
-	// so __try/__except is unambiguously valid here — OnPresent itself
-	// constructs std::string temporaries (in SetSubrect), and mixing __try
-	// with C++ objects needing destructors in the same function is the same
-	// MSVC restriction already respected throughout CallerSpoof.cpp. Same
-	// rationale as CreateFeature's guard above: P may be a borrowed, foreign
-	// parameter block rather than one this code fully controls.
 	bool SafeEvaluateFeature(void* pfnEvaluateFeature, ID3D11DeviceContext* ctx, NVSDK_NGX_Handle* feature, NVSDK_NGX_Parameter* params, NVSDK_NGX_Result* outResult)
 	{
 		__try
@@ -58,14 +51,6 @@ namespace
 		}
 	}
 
-	// PATCH: isolated so __try/__except is valid here -- CompileShaders'
-	// own compile lambda has std::ifstream/stringstream/string objects in
-	// its scope, which can't coexist with __try in the same function under
-	// MSVC (same constraint already applied throughout CallerSpoof.cpp).
-	// Defense-in-depth: the null-device check in CompileShaders should
-	// prevent this from ever faulting, but nothing upstream (Feature.h's
-	// ForEachLoadedFeature loop has zero exception handling) catches a
-	// fault here if some other unexpected state causes one.
 	bool SafeCreateComputeShader(ID3DBlob* blob, ID3D11ComputeShader** out)
 	{
 		__try
@@ -80,13 +65,6 @@ namespace
 		}
 	}
 
-	// PATCH: closes the one remaining unguarded call in CompileShaders --
-	// D3DCompile itself doesn't need the D3D device (it's a standalone
-	// HLSL-to-bytecode compiler), so it wasn't a suspect under the
-	// null-device hypothesis, but leaving it unguarded meant a fault here
-	// specifically would still produce zero log output, undermining the
-	// "CompileShaders always logs something" guarantee this diagnostic
-	// relies on. Isolated for the same __try/C2712 reason as the others.
 	bool SafeD3DCompile(const char* src, size_t srcSize, const char* fileName, const char* entryPoint, ID3DBlob** outBlob, ID3DBlob** outErrorBlob)
 	{
 		__try
@@ -98,88 +76,6 @@ namespace
 		{
 			return false;
 		}
-	}
-
-	// PATCH: isolated so __try/__except is valid here, shared by both
-	// candidate parameter sources CreateFeature now tries in sequence.
-	bool SafeCreateFeatureCall(void* pfnCreateFeature, ID3D11DeviceContext* ctx, NVSDK_NGX_Parameter* params, NVSDK_NGX_Handle** outHandle, NVSDK_NGX_Result* outResult)
-	{
-		__try
-		{
-			*outResult = ((PFN_CreateFeature)pfnCreateFeature)(ctx, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), params, outHandle);
-			return true;
-		}
-		__except (EXCEPTION_EXECUTE_HANDLER)
-		{
-			return false;
-		}
-	}
-
-	using PFN_GetCapabilityParameters = NVSDK_NGX_Result (*)(NVSDK_NGX_Parameter**);
-
-	// PATCH: isolated so __try/__except is valid here, matching every other
-	// Safe* helper in this file.
-	bool SafeGetCapabilityParameters(void* pfnGetCapParams, NVSDK_NGX_Parameter** outParams, NVSDK_NGX_Result* outResult)
-	{
-		__try
-		{
-			*outResult = ((PFN_GetCapabilityParameters)pfnGetCapParams)(outParams);
-			return true;
-		}
-		__except (EXCEPTION_EXECUTE_HANDLER)
-		{
-			return false;
-		}
-	}
-
-	// PATCH: actively calls GetCapabilityParameters ourselves, resolved
-	// directly from _nvngx.dll, instead of passively waiting to intercept
-	// someone else's call to it. Confirmed via the per-target import scan
-	// that no tracked module statically imports this name, and confirmed
-	// via the log that nobody dynamically resolves it through GetProcAddress
-	// either -- Streamline evidently manages its own parameters through an
-	// internal layer that never touches this raw NGX entry point, so
-	// passive interception was never going to catch it. The instance check
-	// already confirmed our own loaded snippet is the same live core
-	// instance, so calling this ourselves through that same confirmed-real
-	// module should be valid. Uses GetModuleHandleW (find already-loaded),
-	// never LoadLibraryW -- the same lesson from the earlier LoadDLL
-	// timing investigation: the real core only becomes findable once
-	// Streamline has loaded it via its own driver-store-aware mechanism.
-	void TryCaptureCapabilityParametersDirectly()
-	{
-		auto& s = NeuralNR::GetState();
-		if (s.capabilityParamsCaptured) return;
-
-		HMODULE hCore = GetModuleHandleW(L"_nvngx.dll");
-		if (!hCore) return;
-
-		auto pfnGetCapParams = GetProcAddress(hCore, "NVSDK_NGX_D3D11_GetCapabilityParameters");
-		if (!pfnGetCapParams) return;
-
-		CSS::CallerSpoof::Install();
-		NVSDK_NGX_Parameter* outParams = nullptr;
-		NVSDK_NGX_Result res = static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
-		bool survived = SafeGetCapabilityParameters((void*)pfnGetCapParams, &outParams, &res);
-		CSS::CallerSpoof::Uninstall();
-
-		if (!survived)
-		{
-			logger::warn("NeuralNR: SEH caught access violation calling GetCapabilityParameters directly.");
-			return;
-		}
-
-		if (!NVSDK_NGX_SUCCEED(res) || !outParams)
-		{
-			static uint32_t s_failLogCounter = 0;
-			if (++s_failLogCounter % 300 == 1)
-				logger::warn("NeuralNR: Direct GetCapabilityParameters call failed, res=0x{:X}", static_cast<uint32_t>(res));
-			return;
-		}
-
-		logger::info("NeuralNR: Direct GetCapabilityParameters call succeeded: {}", (void*)outParams);
-		s.capabilityParams = outParams;
-		s.capabilityParamsCaptured = true;
 	}
 }
 
@@ -196,14 +92,6 @@ bool NeuralNR::CompileShaders()
 {
 	auto& s = GetState();
 
-	// PATCH: kPostPostLoad (this function's only caller, via PostPostLoad)
-	// fires before the game has rendered a single frame -- globals::d3d::
-	// device is only populated later, once the first real Present call is
-	// intercepted. Dereferencing it here when still null is a structured
-	// exception, not a C++ one, and Feature.h's ForEachLoadedFeature loop
-	// has zero exception handling around its callback -- nothing upstream
-	// would catch it. Return cleanly so the caller can retry later (see
-	// OnPresent) once the device actually exists, instead of faulting.
 	if (!globals::d3d::device)
 	{
 		logger::info("NeuralNR: CompileShaders deferred -- D3D device not yet available.");
@@ -244,54 +132,34 @@ bool NeuralNR::CompileShaders()
 bool NeuralNR::CreateFeature()
 {
 	auto& s = GetState();
-	if (!s.pfnCreateFeature) return false;
+	if (!s.pfnCreateFeature || !s.nrParams) return false;
 
-	// PATCH: wide-net cascade across two independent candidate sources,
-	// rather than assuming one is correct. s.nrParams (confirmed Feature
-	// 18, or the SuperSampling wide-net fallback) may be a block already
-	// specialized for a DIFFERENT feature by the time we borrow it -- the
-	// guide's own Section 4 describes CreateFeature expecting the core's
-	// generic GetCapabilityParameters block instead, which is now captured
-	// separately as s.capabilityParams and tried second. Worth remembering
-	// this project is D3D11 with a Streamline-hook architecture that
-	// matches neither the guide's own Vulkan verification nor the
-	// D3D12/Streamline third-party report it credits -- "success" here may
-	// look different from either, so testing both sources on their own
-	// terms is deliberate, not a placeholder until we pick the "right" one.
-	auto attempt = [&](NVSDK_NGX_Parameter* params, const char* label) -> bool {
-		if (!params) return false;
+	CSS::CallerSpoof::Install();
+	NVSDK_NGX_Result res = static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
+	bool survived = true;
+	__try {
+		res = ((PFN_CreateFeature)s.pfnCreateFeature)(
+			globals::d3d::context, static_cast<NVSDK_NGX_Feature>(kFeatureDLSSNR), s.nrParams, &s.nrFeature);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		survived = false;
+	}
+	CSS::CallerSpoof::Uninstall();
 
-		CSS::CallerSpoof::Install();
-		NVSDK_NGX_Result res = static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
-		bool survived = SafeCreateFeatureCall(s.pfnCreateFeature, globals::d3d::context, params, &s.nrFeature, &res);
-		CSS::CallerSpoof::Uninstall();
+	if (!survived)
+	{
+		logger::error("NeuralNR: SEH caught access violation inside CreateFeature.");
+		return false;
+	}
 
-		if (!survived)
-		{
-			logger::error("NeuralNR: SEH caught access violation inside CreateFeature (source={}).", label);
-			return false;
-		}
-		if (!NVSDK_NGX_SUCCEED(res) || !s.nrFeature)
-		{
-			logger::error("NeuralNR: Snippet CreateFeature failed, res=0x{:X} (source={})", static_cast<uint32_t>(res), label);
-			return false;
-		}
-		logger::info("NeuralNR: Snippet CreateFeature Success. Tensor context established. (source={})", label);
-		return true;
-	};
+	if (!NVSDK_NGX_SUCCEED(res) || !s.nrFeature)
+	{
+		logger::error("NeuralNR: Snippet CreateFeature failed, res=0x{:X} (paramsAreBorrowed={})", static_cast<uint32_t>(res), s.paramsAreBorrowed);
+		return false;
+	}
 
-	if (attempt(s.nrParams, s.paramsAreBorrowed ? "SR-borrowed" : "confirmed-Feature18"))
-		return true;
-
-	// PATCH: third candidate -- a second, distinct-caller block, captured
-	// only if a genuinely different module than the one behind s.nrParams
-	// also called CreateFeature for NR or SR (see Hooked_NGXCreate). Tests
-	// "what if two modules both called, and we locked onto the wrong one
-	// first" directly, rather than only observing it in the log.
-	if (attempt(s.nrParamsAlt, s.nrParamsAltBorrowed ? "alt-caller-SR-borrowed" : "alt-caller-confirmed-Feature18"))
-		return true;
-
-	return attempt(s.capabilityParams, "core-GetCapabilityParameters");
+	logger::info("NeuralNR: Snippet CreateFeature Success. Tensor context established. (paramsAreBorrowed={})", s.paramsAreBorrowed);
+	return true;
 }
 
 void NeuralNR::CreateResources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
@@ -420,30 +288,13 @@ void NeuralNR::OnPresent()
 
 	auto& s = GetState();
 
-	// 1. Dynamic Interceptor Poll: continuously ensures IAT hooks are attached
 	CSS::CallerSpoof::InstallActiveInterceptors();
 
-	// PATCH: lazy retry for shader compilation deferred in PostPostLoad
-	// (D3D device wasn't available that early). By the time OnPresent runs
-	// at all, a real Present call has occurred, so the device is
-	// guaranteed valid here -- safe to retry unconditionally until it
-	// succeeds once.
 	if (!s.proxyCS || !s.transferCS)
 		CompileShaders();
 
-	// PATCH: actively try capturing GetCapabilityParameters ourselves each
-	// frame until it succeeds once -- see TryCaptureCapabilityParametersDirectly
-	// for why passive interception was abandoned for this specific source.
-	if (!s.capabilityParamsCaptured)
-		TryCaptureCapabilityParametersDirectly();
-
-	// 2. Await parameter capture from active DLSS execution (or after toggling DLSS in menu)
 	if (!s.streamlineContextCaptured || !s.nrParams || !s.pfnEvaluateFeature || !s.pfnCreateFeature) 
 	{
-		// PATCH: was a single generic "waiting" message — now shows exactly
-		// which of the four gate conditions is still unmet, readable
-		// directly from this log without cross-referencing CallerSpoof's
-		// separate log stream.
 		static uint32_t s_waitCounter = 0;
 		if (++s_waitCounter % 300 == 1)
 			logger::info("NeuralNR: Waiting — streamlineContextCaptured={}, nrParams={}, pfnEvaluateFeature={}, pfnCreateFeature={}, paramsAreBorrowed={}",
@@ -451,16 +302,6 @@ void NeuralNR::OnPresent()
 		return; 
 	}
 
-	// PATCH: fires once, the moment we have SOMETHING to work with,
-	// regardless of whether CreateFeature ever succeeds afterward -- this
-	// was previously placed after a successful EvaluateFeature call, which
-	// meant it never fired at all given CreateFeature has never once
-	// succeeded. Confirms whether our own directly-loaded snippet DLL
-	// instance matches Streamline's own loaded copy: if they match, a
-	// handle Streamline created against its copy is safe to hand to our
-	// resolved function pointers (same module, same internal state either
-	// way); if they differ, that's a real, separate problem worth knowing
-	// about independent of which parameter source ends up working.
 	static bool s_loggedInstanceCheck = false;
 	if (!s_loggedInstanceCheck)
 	{
@@ -478,7 +319,6 @@ void NeuralNR::OnPresent()
 	if (s.w != w || s.h != h) s.needsReset = true;
 	CreateResources(w, h, dsc.Format);
 
-	// 3. 3D Scene Gate
 	if (!s.mvSRV || !s.depthSRV) 
 	{
 		static uint32_t s_resourceWaitCounter = 0;
@@ -488,7 +328,6 @@ void NeuralNR::OnPresent()
 		return; 
 	}
 
-	// 4. Feature Creation on DLSS-NR snippet using captured parameters
 	if (!s.nrFeature) {
 		static uint32_t s_createRetry = 0;
 		if (s_createRetry++ % 60 == 0) {
@@ -569,12 +408,11 @@ void NeuralNR::OnPresent()
 	P->Set("MV.Scale.Y",    settings.mvScaleY);
 	P->Set("Depth.Inverted",static_cast<unsigned int>(settings.depthInverted));
 
-	// 5. Snippet Execution
 	CSS::CallerSpoof::Install();
 	NVSDK_NGX_Result evalRes = static_cast<NVSDK_NGX_Result>(0xDEADBEEF);
 	if (!SafeEvaluateFeature(s.pfnEvaluateFeature, ctx, s.nrFeature, P, &evalRes))
 	{
-		logger::error("NeuralNR: SEH caught access violation calling EvaluateFeature — likely incompatible with the borrowed parameter block.");
+		logger::error("NeuralNR: SEH caught access violation calling EvaluateFeature.");
 	}
 	CSS::CallerSpoof::Uninstall();
 
@@ -603,24 +441,10 @@ void NeuralNR::OnPresent()
 
 void NeuralNR::PostPostLoad()
 {
-	// Diagnostic — confirms whether this function is even being invoked by
-	// SKSE's messaging system at all, independent of anything downstream.
-	// Placed before GetState()/CompileShaders() so nothing in this
-	// function's own logic can swallow it before it fires.
 	logger::info("NeuralNR: PostPostLoad entered.");
 
 	auto& s = GetState();
 
-	// PATCH: CompileShaders() needs the D3D device, which this early in
-	// the lifecycle may not exist yet (see CompileShaders' own guard).
-	// Previously a failure here returned out of PostPostLoad entirely,
-	// blocking the snippet load and the Detours ambush below -- neither of
-	// which depends on the device at all, and the ambush specifically
-	// benefits from installing as early as possible (it's what lets it
-	// catch Streamline's own resolution before Streamline itself boots).
-	// Attempt shader compilation, but don't let a deferred failure here
-	// block anything else -- it retries lazily from OnPresent() once the
-	// device exists.
 	if (!CompileShaders())
 		logger::info("NeuralNR: shader compile deferred or failed; will retry from OnPresent.");
 
@@ -635,9 +459,6 @@ void NeuralNR::PostPostLoad()
 		s.pfnEvaluateFeature = GetProcAddress(s.hSnippetDLL, "NVSDK_NGX_D3D11_EvaluateFeature");
 		logger::info("NeuralNR: Target snippet loaded. Exports resolved.");
 	} else {
-		// PATCH: no longer returns here -- the Detours ambush below is
-		// fully independent of whether our own direct snippet load
-		// succeeded, so an unrelated failure here shouldn't block it.
 		logger::warn("NeuralNR: Target snippet nvngx_dlssnr.dll could not be loaded.");
 	}
 

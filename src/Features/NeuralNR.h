@@ -27,33 +27,12 @@ struct NeuralNR : public Feature
     {
         std::atomic<bool> needsReset{true};
         bool streamlineContextCaptured = false; 
-        // PATCH: set by CallerSpoof.cpp's Hooked_NGXCreate specifically when
-        // the SuperSampling (Feature 1) fallback fires instead of confirmed
-        // Feature 18 -- lets every downstream log line here state which
-        // source actually supplied nrParams, instead of needing to
-        // cross-reference CallerSpoof's separate log stream by timestamp.
         bool paramsAreBorrowed = false;
         
         HMODULE hSnippetDLL = nullptr;
         
         NVSDK_NGX_Handle* nrFeature = nullptr;
         NVSDK_NGX_Parameter* nrParams = nullptr;
-        // PATCH: a SEPARATE candidate source for CreateFeature, captured
-        // from the core's own GetCapabilityParameters call -- a generic,
-        // feature-agnostic block, distinct from nrParams (which may be
-        // SuperSampling's own already-specialized block when borrowed).
-        // Never overwrites nrParams; CreateFeature tries both in sequence.
-        NVSDK_NGX_Parameter* capabilityParams = nullptr;
-        bool capabilityParamsCaptured = false;
-        // PATCH: second, independent candidate -- captured only when a
-        // DIFFERENT module than the one that supplied nrParams calls
-        // CreateFeature for NR or SR. Directly tests "what if two modules
-        // both call, and we locked onto the wrong one first" instead of
-        // just observing the second caller in the log without ever trying
-        // its data. Never overwrites nrParams.
-        NVSDK_NGX_Parameter* nrParamsAlt = nullptr;
-        bool nrParamsAltBorrowed = false;
-        std::string nrParamsCallerModule;
         
         void* pfnCreateFeature = nullptr;
         void* pfnEvaluateFeature = nullptr;
