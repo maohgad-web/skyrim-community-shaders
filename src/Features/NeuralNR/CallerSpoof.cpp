@@ -100,7 +100,6 @@ namespace CSS::CallerSpoof
 			__except (EXCEPTION_EXECUTE_HANDLER) {}
 		}
 
-		// Suppress native Streamline evaluation for NR to avoid D3D11 race conditions
 		if (isConfirmedNR)
 		{
 			static uint32_t s_suppressLog = 0;
@@ -145,37 +144,33 @@ namespace CSS::CallerSpoof
 
 	enum slFeature : uint32_t { kFeatureDLSS_NR = 1004 }; 
 	
-	// FIXED: Correctly aligned layout matching the official Streamline 2.x SDK
 	struct slPreferences {
 		void* allocateCallback;
 		void* freeCallback;
 		void* logMessageCallback;
 		uint32_t logLevel;
-		const wchar_t** pathsToPlugins; // Now correctly placed at +32 bytes (after 4b padding)
+		const wchar_t** pathsToPlugins;
 		uint32_t numPathsToPlugins;
-		const slFeature* featuresToLoad; // Now correctly placed at +48 bytes
+		const slFeature* featuresToLoad;
 		uint32_t numFeaturesToLoad;
 	};
 
-	using slInit_t = int (*)(const void*, void*, void*);
+	using slInit_t = int (*)(const slPreferences*, uint64_t);
 	using slIsFeatureSupported_t = int (*)(slFeature, const void*);
-	using slGetPluginFunction_t = void* (*)(const char*);
 	using slOnPluginLoad_t = bool (*)(sl::param::IParameters*);
 
 	static slInit_t s_orig_slInit = nullptr;
 	static slIsFeatureSupported_t s_orig_slIsFeatureSupported = nullptr;
-	static slGetPluginFunction_t s_orig_slGetPluginFunction_nr = nullptr;
 	static slOnPluginLoad_t s_orig_slOnPluginLoad_nr = nullptr;
+	
 	static std::vector<slFeature> s_modifiedFeatures;
+	static slPreferences s_persistentPref; // Persistent copy prevents read-only AVs and thread races
 
-	static int Hooked_slInit(const void* pref_opaque, void* app, void* device)
+	static int Hooked_slInit(const slPreferences* pref, uint64_t app)
 	{
-		if (!pref_opaque) {
-			return s_orig_slInit(pref_opaque, app, device);
-		}
+		if (!pref) return s_orig_slInit(pref, app);
 
-		// Modify safely in place instead of copying the struct to prevent truncation
-		slPreferences* pref = (slPreferences*)const_cast<void*>(pref_opaque);
+		s_persistentPref = *pref;
 		s_modifiedFeatures.clear();
 		
 		bool nrFound = false;
@@ -186,25 +181,14 @@ namespace CSS::CallerSpoof
 			}
 		}
 		
-		const slFeature* origFeatures = pref->featuresToLoad;
-		uint32_t origNum = pref->numFeaturesToLoad;
-
 		if (!nrFound) {
 			s_modifiedFeatures.push_back(kFeatureDLSS_NR);
-			pref->featuresToLoad = s_modifiedFeatures.data();
-			pref->numFeaturesToLoad = static_cast<uint32_t>(s_modifiedFeatures.size());
+			s_persistentPref.featuresToLoad = s_modifiedFeatures.data();
+			s_persistentPref.numFeaturesToLoad = static_cast<uint32_t>(s_modifiedFeatures.size());
 			logger::info("NeuralNR [Streamline]: Injected Feature 1004 (DLSS-NR) into slPreferences.");
 		}
 		
-		int result = s_orig_slInit(pref_opaque, app, device);
-
-		// Restore original pointers after execution
-		if (!nrFound) {
-			pref->featuresToLoad = origFeatures;
-			pref->numFeaturesToLoad = origNum;
-		}
-		
-		return result;
+		return s_orig_slInit(&s_persistentPref, app);
 	}
 
 	static int Hooked_slIsFeatureSupported(slFeature feature, const void* pArch)
@@ -252,17 +236,6 @@ namespace CSS::CallerSpoof
 		
 		logger::info("NeuralNR [Streamline]: Original sl.dlss_nr.dll slOnPluginLoad returned {}. Forcing TRUE to bypass manifest gate.", result);
 		return true; 
-	}
-
-	static void* Hooked_slGetPluginFunction_NR(const char* functionName)
-	{
-		void* func = s_orig_slGetPluginFunction_nr(functionName);
-		if (functionName && _stricmp(functionName, "slOnPluginLoad") == 0) {
-			logger::info("NeuralNR [Streamline]: Intercepted slGetPluginFunction request for slOnPluginLoad.");
-			s_orig_slOnPluginLoad_nr = (slOnPluginLoad_t)func;
-			return (void*)Hooked_slOnPluginLoad_NR;
-		}
-		return func;
 	}
 
 	static FARPROC WINAPI Hooked_GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
@@ -405,7 +378,6 @@ namespace CSS::CallerSpoof
 
 				PatchTargetModuleAndMarkHooked(hLoaded, idx);
 
-				// Hybrid Detours Strategy for Streamline
 				if (_wcsicmp(fileName, L"sl.interposer.dll") == 0) {
 					void* pSlInit = (void*)GetProcAddress(hLoaded, "slInit");
 					void* pSlIsFeatureSupported = (void*)GetProcAddress(hLoaded, "slIsFeatureSupported");
@@ -421,14 +393,14 @@ namespace CSS::CallerSpoof
 					}
 				}
 				else if (_wcsicmp(fileName, L"sl.dlss_nr.dll") == 0) {
-					void* pGetPlugin = (void*)GetProcAddress(hLoaded, "slGetPluginFunction");
-					if (pGetPlugin) {
+					void* pOnPluginLoad = (void*)GetProcAddress(hLoaded, "slOnPluginLoad");
+					if (pOnPluginLoad) {
 						DetourTransactionBegin();
 						DetourUpdateThread(GetCurrentThread());
-						s_orig_slGetPluginFunction_nr = (slGetPluginFunction_t)pGetPlugin;
-						DetourAttach(&(PVOID&)s_orig_slGetPluginFunction_nr, (PVOID)Hooked_slGetPluginFunction_NR);
+						s_orig_slOnPluginLoad_nr = (slOnPluginLoad_t)pOnPluginLoad;
+						DetourAttach(&(PVOID&)s_orig_slOnPluginLoad_nr, (PVOID)Hooked_slOnPluginLoad_NR);
 						DetourTransactionCommit();
-						logger::info("NeuralNR [Streamline]: Detoured slGetPluginFunction on sl.dlss_nr.dll");
+						logger::info("NeuralNR [Streamline]: Detoured slOnPluginLoad on sl.dlss_nr.dll");
 					}
 				}
 			}
