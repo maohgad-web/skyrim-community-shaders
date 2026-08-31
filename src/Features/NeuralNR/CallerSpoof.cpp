@@ -119,7 +119,7 @@ namespace CSS::CallerSpoof
 		return static_cast<NVSDK_NGX_Result>(0xBAD00007);
 	}
 
-	// --- Hybrid Streamline Interceptors ---
+	// --- Graceful Non-Slicing Streamline Probes ---
 	namespace sl::param {
 		struct IParameters {
 			virtual int set_bool(const char* key, bool value) = 0;
@@ -143,20 +143,9 @@ namespace CSS::CallerSpoof
 	}
 
 	enum slFeature : uint32_t { kFeatureDLSS_NR = 1004 }; 
-	
-	struct slPreferences {
-		void* allocateCallback;
-		void* freeCallback;
-		void* logMessageCallback;
-		uint32_t logLevel;
-		const wchar_t** pathsToPlugins;
-		uint32_t numPathsToPlugins;
-		const slFeature* featuresToLoad;
-		uint32_t numFeaturesToLoad;
-	};
 
-	using slInit_t = int (*)(const slPreferences*, uint64_t);
-	using slIsFeatureSupported_t = int (*)(slFeature, const void*);
+	using slInit_t = int (*)(const void*, uint64_t);
+	using slIsFeatureSupported_t = int (*)(uint32_t, const void*);
 	using slOnPluginLoad_t = bool (*)(sl::param::IParameters*);
 
 	static slInit_t s_orig_slInit = nullptr;
@@ -164,40 +153,85 @@ namespace CSS::CallerSpoof
 	static slOnPluginLoad_t s_orig_slOnPluginLoad_nr = nullptr;
 	
 	static std::vector<slFeature> s_modifiedFeatures;
-	static slPreferences s_persistentPref; // Persistent copy prevents read-only AVs and thread races
+	static std::vector<uint8_t> s_clonedPrefBuffer;
 
-	static int Hooked_slInit(const slPreferences* pref, uint64_t app)
+	static int Hooked_slInit(const void* pref, uint64_t app)
 	{
 		if (!pref) return s_orig_slInit(pref, app);
 
-		s_persistentPref = *pref;
-		s_modifiedFeatures.clear();
-		
-		bool nrFound = false;
-		if (pref->featuresToLoad && pref->numFeaturesToLoad > 0) {
-			for (uint32_t i = 0; i < pref->numFeaturesToLoad; ++i) {
-				s_modifiedFeatures.push_back(pref->featuresToLoad[i]);
-				if (pref->featuresToLoad[i] == kFeatureDLSS_NR) nrFound = true;
+		bool successfullyInjected = false;
+		const void* prefToPass = pref;
+
+		__try {
+			// Probe the memory layout without truncating: allocate a 256-byte safety clone
+			s_clonedPrefBuffer.resize(256, 0);
+			memcpy(s_clonedPrefBuffer.data(), pref, 256);
+
+			// Offset 48 = featuresToLoad pointer, Offset 56 = numFeaturesToLoad (standard 64-bit Streamline layout)
+			uintptr_t* pFeaturesPtr = reinterpret_cast<uintptr_t*>(s_clonedPrefBuffer.data() + 48);
+			uint32_t* pNumFeatures = reinterpret_cast<uint32_t*>(s_clonedPrefBuffer.data() + 56);
+
+			const slFeature* originalFeatures = reinterpret_cast<const slFeature*>(*pFeaturesPtr);
+			uint32_t count = *pNumFeatures;
+
+			s_modifiedFeatures.clear();
+			bool nrFound = false;
+
+			if (originalFeatures && count > 0 && count < 64) {
+				for (uint32_t i = 0; i < count; ++i) {
+					s_modifiedFeatures.push_back(originalFeatures[i]);
+					if (originalFeatures[i] == kFeatureDLSS_NR) nrFound = true;
+				}
+			}
+
+			if (!nrFound) {
+				s_modifiedFeatures.push_back(kFeatureDLSS_NR);
+				*pFeaturesPtr = reinterpret_cast<uintptr_t>(s_modifiedFeatures.data());
+				*pNumFeatures = static_cast<uint32_t>(s_modifiedFeatures.size());
+				logger::info("NeuralNR [Streamline]: Gracefully injected Feature 1004 (DLSS-NR) via non-destructive clone.");
+			}
+
+			prefToPass = s_clonedPrefBuffer.data();
+			successfullyInjected = true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			logger::warn("NeuralNR [Streamline]: SEH caught access during slPreferences probe — falling back to untouched passthrough.");
+			prefToPass = pref;
+		}
+
+		int res = 0;
+		__try {
+			res = s_orig_slInit(prefToPass, app);
+			logger::info("NeuralNR [Streamline]: slInit completed with result code: {}", res);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			logger::error("NeuralNR [Streamline]: Crash caught inside native slInit — falling back to untouched struct.");
+			if (successfullyInjected) {
+				res = s_orig_slInit(pref, app);
 			}
 		}
-		
-		if (!nrFound) {
-			s_modifiedFeatures.push_back(kFeatureDLSS_NR);
-			s_persistentPref.featuresToLoad = s_modifiedFeatures.data();
-			s_persistentPref.numFeaturesToLoad = static_cast<uint32_t>(s_modifiedFeatures.size());
-			logger::info("NeuralNR [Streamline]: Injected Feature 1004 (DLSS-NR) into slPreferences.");
-		}
-		
-		return s_orig_slInit(&s_persistentPref, app);
+
+		return res;
 	}
 
-	static int Hooked_slIsFeatureSupported(slFeature feature, const void* pArch)
+	static int Hooked_slIsFeatureSupported(uint32_t feature, const void* pArch)
 	{
+		logger::info("NeuralNR [Streamline]: Feature support queried for Feature ID: {}", feature);
+
 		if (feature == kFeatureDLSS_NR) {
-			logger::info("NeuralNR [Streamline]: Spoofing slIsFeatureSupported for 1004 -> eOk");
+			logger::info("NeuralNR [Streamline]: Spoofing slIsFeatureSupported for 1004 (DLSS-NR) -> eOk");
 			return 0; 
 		}
-		return s_orig_slIsFeatureSupported(feature, pArch);
+
+		if (s_orig_slIsFeatureSupported) {
+			__try {
+				return s_orig_slIsFeatureSupported(feature, pArch);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return 0;
+			}
+		}
+		return 0;
 	}
 
 	static bool Hooked_slOnPluginLoad_NR(sl::param::IParameters* params)
